@@ -1,18 +1,12 @@
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-
+#include "../engine/platform.h"
 #include "EngineProxy.h"
 #include "HttpServer.h"
 #include <cstdio>
 #include <cstring>
-#include <windows.h>
 
 EngineProxy::EngineProxy(uint16_t enginePort)
     : _enginePort(enginePort) {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2,2), &wsa);
+    plat_net_init();
 }
 
 EngineProxy::~EngineProxy() { disconnect(); }
@@ -21,16 +15,16 @@ bool EngineProxy::connect(const char* host) {
     if (_connected.load()) return true;
 
     _sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (_sock == INVALID_SOCKET) return false;
+    if (_sock == INVALID_SOCK) return false;
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(_enginePort);
     inet_pton(AF_INET, host, &addr.sin_addr);
 
-    if (::connect(_sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(_sock);
-        _sock = INVALID_SOCKET;
+    if (::connect(_sock, (sockaddr*)&addr, sizeof(addr)) == SOCK_ERR) {
+        plat_close_socket(_sock);
+        _sock = INVALID_SOCK;
         return false;
     }
 
@@ -41,10 +35,10 @@ bool EngineProxy::connect(const char* host) {
 
 void EngineProxy::disconnect() {
     if (!_connected.exchange(false)) return;
-    if (_sock != INVALID_SOCKET) {
-        shutdown(_sock, SD_BOTH);
-        closesocket(_sock);
-        _sock = INVALID_SOCKET;
+    if (_sock != INVALID_SOCK) {
+        plat_shutdown(_sock);
+        plat_close_socket(_sock);
+        _sock = INVALID_SOCK;
     }
     if (_recvThread.joinable()) _recvThread.join();
 }

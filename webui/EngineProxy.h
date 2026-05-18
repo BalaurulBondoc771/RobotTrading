@@ -1,6 +1,5 @@
 #pragma once
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
+#include "../engine/platform.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -29,7 +28,7 @@ public:
 
 private:
     uint16_t          _enginePort;
-    SOCKET            _sock = INVALID_SOCKET;
+    socket_t          _sock = INVALID_SOCK;
     std::atomic<bool> _connected{false};
     HttpServer*       _http = nullptr;
     std::thread       _recvThread;

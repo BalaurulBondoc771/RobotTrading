@@ -2,25 +2,28 @@
 // webui_main.cpp — Web UI process
 //
 // Connects to engine on :7799, serves browser UI on :8080.
-// Start robottrading_engine.exe first, then this.
+// Start robottrading_engine first, then this.
 // Open http://localhost:8080 in browser.
 // ============================================================
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
+#include "engine/platform.h"
+#include "webui/EngineProxy.h"
+#include "webui/HttpServer.h"
 #include <cstdio>
+#include <csignal>
 #include <thread>
 #include <chrono>
 
-#include "webui/EngineProxy.h"
-#include "webui/HttpServer.h"
+#ifdef _WIN32
+#  include <shellapi.h>
+#  pragma comment(lib, "shell32.lib")
+static BOOL WINAPI consoleHandler(DWORD) { return TRUE; }
+#else
+static volatile sig_atomic_t g_stop = 0;
+static void sigHandler(int) { g_stop = 1; }
+#endif
 
 int main() {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2,2), &wsa);
-
     EngineProxy proxy(7799);
     HttpServer  http(proxy, 8080);
 
@@ -42,18 +45,24 @@ int main() {
         }
     }
 
-    // Open browser automatically
+    // Open browser automatically (Windows only)
+#ifdef _WIN32
     ShellExecuteA(nullptr, "open", "http://localhost:8080", nullptr, nullptr, SW_SHOWNORMAL);
-
-    // Block until engine disconnects or Ctrl+C
-    SetConsoleCtrlHandler([](DWORD) -> BOOL { return TRUE; }, TRUE);
+    SetConsoleCtrlHandler(consoleHandler, TRUE);
     while (proxy.isConnected()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    printf("[ui] Engine disconnected. Shutting down.\n");
+#else
+    signal(SIGINT,  sigHandler);
+    signal(SIGTERM, sigHandler);
+    printf("[ui] Open http://localhost:8080 in your browser\n");
+    while (proxy.isConnected() && !g_stop) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+#endif
 
+    printf("[ui] Shutting down.\n");
     http.stop();
     proxy.disconnect();
-    WSACleanup();
     return 0;
 }

@@ -1,6 +1,5 @@
 #pragma once
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
+#include "../engine/platform.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -32,19 +31,19 @@ public:
 private:
     EngineProxy& _proxy;
     uint16_t     _port;
-    SOCKET       _listenSock = INVALID_SOCKET;
+    socket_t     _listenSock = INVALID_SOCK;
     std::atomic<bool> _running{false};
     std::thread  _acceptThread;
 
-    std::mutex          _sseMux;
-    std::vector<SOCKET> _sseClients;
+    std::mutex             _sseMux;
+    std::vector<socket_t>  _sseClients;
 
     void acceptLoop();
-    void handleClient(SOCKET s);
+    void handleClient(socket_t s);
 
-    void serveHtml    (SOCKET s);
-    void serveEvents  (SOCKET s);  // keeps socket open for SSE
-    void handleCommand(SOCKET s, const char* body, int bodyLen);
+    void serveHtml    (socket_t s);
+    void serveEvents  (socket_t s);  // keeps socket open for SSE
+    void handleCommand(socket_t s, const char* body, int bodyLen);
 
-    static bool sendAll(SOCKET s, const char* data, int len);
+    static bool sendAll(socket_t s, const char* data, int len);
 };

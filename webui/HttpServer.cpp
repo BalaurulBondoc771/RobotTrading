@@ -1,15 +1,10 @@
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-
+#include "../engine/platform.h"
 #include "HttpServer.h"
 #include "EngineProxy.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
-#include <windows.h>
 
 // ============================================================
 // Embedded HTML page (raw string literal — C++11)
@@ -272,7 +267,7 @@ HttpServer::~HttpServer() { stop(); }
 
 bool HttpServer::start() {
     _listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (_listenSock == INVALID_SOCKET) return false;
+    if (_listenSock == INVALID_SOCK) return false;
 
     int one = 1;
     setsockopt(_listenSock, SOL_SOCKET, SO_REUSEADDR, (char*)&one, sizeof(one));
@@ -282,10 +277,10 @@ bool HttpServer::start() {
     addr.sin_port        = htons(_port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(_listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR ||
-        listen(_listenSock, 16) == SOCKET_ERROR) {
-        closesocket(_listenSock);
-        _listenSock = INVALID_SOCKET;
+    if (bind(_listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCK_ERR ||
+        listen(_listenSock, 16) == SOCK_ERR) {
+        plat_close_socket(_listenSock);
+        _listenSock = INVALID_SOCK;
         return false;
     }
 
@@ -296,13 +291,13 @@ bool HttpServer::start() {
 
 void HttpServer::stop() {
     if (!_running.exchange(false)) return;
-    if (_listenSock != INVALID_SOCKET) {
-        closesocket(_listenSock);
-        _listenSock = INVALID_SOCKET;
+    if (_listenSock != INVALID_SOCK) {
+        plat_close_socket(_listenSock);
+        _listenSock = INVALID_SOCK;
     }
     {
         std::lock_guard<std::mutex> lk(_sseMux);
-        for (SOCKET s : _sseClients) closesocket(s);
+        for (socket_t s : _sseClients) plat_close_socket(s);
         _sseClients.clear();
     }
     if (_acceptThread.joinable()) _acceptThread.join();
@@ -310,15 +305,15 @@ void HttpServer::stop() {
 
 void HttpServer::acceptLoop() {
     while (_running.load()) {
-        SOCKET c = accept(_listenSock, nullptr, nullptr);
-        if (c == INVALID_SOCKET) break;
+        socket_t c = accept(_listenSock, nullptr, nullptr);
+        if (c == INVALID_SOCK) break;
         std::thread t([this, c]{ handleClient(c); });
         t.detach();
     }
 }
 
 // Minimal HTTP request parser: extract method, path, body.
-void HttpServer::handleClient(SOCKET s) {
+void HttpServer::handleClient(socket_t s) {
     char req[8192] = {};
     int  total     = 0;
 
@@ -342,7 +337,7 @@ void HttpServer::handleClient(SOCKET s) {
         else {
             const char* r404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
             sendAll(s, r404, (int)strlen(r404));
-            closesocket(s);
+            plat_close_socket(s);
         }
 
     } else if (strcmp(method, "POST") == 0) {
@@ -368,16 +363,16 @@ void HttpServer::handleClient(SOCKET s) {
 
         const char* r200 = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
         sendAll(s, r200, (int)strlen(r200));
-        closesocket(s);
+        plat_close_socket(s);
 
     } else {
         const char* r405 = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
         sendAll(s, r405, (int)strlen(r405));
-        closesocket(s);
+        plat_close_socket(s);
     }
 }
 
-void HttpServer::serveHtml(SOCKET s) {
+void HttpServer::serveHtml(socket_t s) {
     int htmlLen = (int)strlen(HTML_PAGE);
     char hdr[256];
     int hdrLen = snprintf(hdr, sizeof(hdr),
@@ -391,7 +386,7 @@ void HttpServer::serveHtml(SOCKET s) {
     closesocket(s);
 }
 
-void HttpServer::serveEvents(SOCKET s) {
+void HttpServer::serveEvents(socket_t s) {
     const char* hdr =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
@@ -417,10 +412,10 @@ void HttpServer::serveEvents(SOCKET s) {
         auto it = std::find(_sseClients.begin(), _sseClients.end(), s);
         if (it != _sseClients.end()) _sseClients.erase(it);
     }
-    closesocket(s);
+    plat_close_socket(s);
 }
 
-void HttpServer::handleCommand(SOCKET /*s*/, const char* body, int bodyLen) {
+void HttpServer::handleCommand(socket_t /*s*/, const char* body, int bodyLen) {
     if (bodyLen <= 0) return;
     char buf[2048];
     int n = bodyLen < (int)sizeof(buf)-1 ? bodyLen : (int)sizeof(buf)-1;
@@ -435,11 +430,11 @@ void HttpServer::pushEvent(const char* json) {
     if (n <= 0) return;
 
     std::lock_guard<std::mutex> lk(_sseMux);
-    for (SOCKET s : _sseClients)
+    for (socket_t s : _sseClients)
         send(s, frame, n, 0); // failures detected when browser disconnects via recv loop
 }
 
-bool HttpServer::sendAll(SOCKET s, const char* data, int len) {
+bool HttpServer::sendAll(socket_t s, const char* data, int len) {
     int sent = 0;
     while (sent < len) {
         int r = send(s, data + sent, len - sent, 0);
