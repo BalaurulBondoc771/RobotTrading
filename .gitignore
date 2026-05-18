@@ -1,0 +1,29 @@
+# Build output
+build/
+out/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# vcpkg installed packages (reproduced by cmake with toolchain file)
+build/vcpkg_installed/
+
+# IBKR TWS API sources — not redistributable, must be placed manually
+IBApi/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.sdf
+*.VC.db
+*.VC.opendb
+CMakeSettings.json
+
+# OS
+Thumbs.db
+.DS_Store

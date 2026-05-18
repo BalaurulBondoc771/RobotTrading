@@ -1,0 +1,8 @@
+# Normalize line endings: checkout as-is, commit as LF
+* text=auto eol=lf
+
+# Force binary for compiled outputs that might accidentally be tracked
+*.exe binary
+*.obj binary
+*.lib binary
+*.pdb binary
