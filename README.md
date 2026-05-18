@@ -446,6 +446,131 @@ Press **Ctrl+C** in the engine terminal (or send SIGTERM on Linux). The engine c
 
 ---
 
+## Updates
+
+### C# → C++ rewrite: what changed and why
+
+The original version (`PH-V2`) was a C# Windows Forms application — a single process where UI, trading logic, and IBKR callbacks shared the same class (`Form1 : Form, EWrapper`). This section documents the concrete differences between the two versions.
+
+---
+
+#### 1. Architecture — the most important change
+
+**C# (PH-V2):** Single process. UI repainting, order placement, and IBKR callbacks all run in the same application. If the UI is redrawing a 200-strike chain, trading is delayed.
+
+**C++ (RobotTrading):** Two completely separate processes. The engine has no UI dependencies. If the browser freezes, orders still get placed.
+
+---
+
+#### 2. `execDetails` — critical for hedge latency
+
+**C#:**
+```csharp
+public void execDetails(...) {
+    this.Invoke(new Action(() => { ... })); // BLOCKS the IBKR reader thread
+```
+`this.Invoke` is **synchronous** — the IBKR reader thread waits for the UI thread to be free before processing the fill. If the UI is repainting at that moment, this adds **50–200 ms to hedge latency**.
+
+**C++:** Runs directly on the IBKR reader thread (core 2). No UI, no blocking, no marshaling.
+
+---
+
+#### 3. Lock type on the processing path
+
+**C#:** `lock(_processLock)` = `Monitor.Enter/Exit` = .NET runtime mutex → **~100–300 ns per acquisition**. The `spotSens` pre-filter is **inside** the lock — every single tick acquires it.
+
+**C++:** Cache-line-aligned `SpinLock` with `_mm_pause()` → **~5–10 ns**. Both the `_contractsSet` check and the `spotSens` filter run **before** the spinlock. ~85–90% of ticks never touch the lock at all.
+
+---
+
+#### 4. Heap allocations on the hot path
+
+**C# — every order placement:**
+```csharp
+Order o = new Order { Action = "BUY", OrderType = "LMT", Tif = "DAY", ... };
+// 4+ heap allocations + GC pressure on every call
+```
+
+**C++:** `_entryOrderTemplate` is built once at `armContract()` time. On the hot path only `lmtPrice` is updated. Zero heap allocations.
+
+Same for hedge orders — C# allocates a new `Order` with `action = (Right == "C") ? "SELL" : "BUY"` on every hedge. C++ uses two pre-built templates (`_hedgeCallTemplate`, `_hedgePutTemplate`) selected by a single bool branch.
+
+---
+
+#### 5. String comparisons on every tick
+
+**C#:**
+```csharp
+double intrinsic = (OptionContract.Right == "C") // heap string compare every tick
+    ? Math.Max(0, mid - OptionContract.Strike)
+    : Math.Max(0, OptionContract.Strike - mid);
+```
+
+**C++:** `bool _isCall` and `double _armedStrike` are pre-cached at `armContract()` time on the same cache line as other hot state. One branch on a local bool, one read of a local double.
+
+---
+
+#### 6. Market data parsing
+
+**C# (IQFeed):** Uses `IQFeed.CSharpApiClient` — a managed library that parses IQFeed's proprietary text protocol, allocates managed objects per message, and passes data through multiple abstraction layers. Symbol format: `SPY241220C500` (month encoded as letter: A=Jan call, M=Jan put).
+
+**C++ (ThetaData):** Custom WebSocket client with a single-pass JSON parser. All fields extracted in one scan. Hand-rolled `fast_atof` / `fast_atoll` (~10–30 ns each vs ~100–300 ns for MSVC `atof`). Symbol format: `SPY20241220C500000` (OSI standard, strike in millicents).
+
+---
+
+#### 7. `DateTime.Now` on every tick
+
+**C#:** `_lastIqDataTime = DateTime.Now` on **every** IQFeed callback + `DateTime.Now - _lastEntryModTime` comparisons inside the lock. `DateTime.Now` is a syscall with allocation overhead.
+
+**C++:** `Clock::now()` (steady_clock) called once, before the spinlock, result reused throughout `processPrice`. Not called at all on filtered ticks.
+
+---
+
+#### 8. Thread priority and CPU affinity
+
+**C#:** Threads created as `IsBackground = true` with no explicit priority or affinity. The OS scheduler can preempt them at any time.
+
+**C++:**
+- Entire process: `REALTIME_PRIORITY_CLASS` (Windows) / `SCHED_FIFO 99` (Linux)
+- ThetaData recv thread: `TIME_CRITICAL` / `SCHED_FIFO 99`, pinned to core 3
+- IBKR trade reader: `HIGHEST` / `SCHED_FIFO 80`, pinned to core 2
+- `mlockall(MCL_CURRENT | MCL_FUTURE)` on Linux prevents page-fault jitter
+
+---
+
+#### 9. Exception handling on the hot path
+
+**C#** `ProcessPrice`:
+```csharp
+lock (_processLock) {
+    try { ... }
+    catch { }  // non-zero overhead even when no exception is thrown
+}
+```
+
+**C++:** No exceptions on the hot path. All critical functions are `noexcept`. No `try/catch` overhead.
+
+---
+
+#### 10. Logic — unchanged
+
+The trading logic itself is identical between versions: same entry modes (static price / dynamic discount), same triple-sensor hedge (`execDetails` + `orderStatus` + `updatePortfolio`), same edge calculation, same parameters. Only the execution infrastructure changed.
+
+---
+
+#### Estimated latency comparison
+
+| Operation | C# (PH-V2) | C++ (RobotTrading) |
+|---|---|---|
+| Lock acquisition (processing path) | ~150 ns | ~7 ns |
+| Filtered tick (spotSens) | ~150 ns (enters lock first) | ~15 ns (returns before lock) |
+| Market data message parse | ~2500 ns | ~350 ns |
+| Order placement (alloc overhead) | ~800 ns extra (GC) | 0 alloc |
+| execDetails → evaluateHedge | +UI thread delay (0–200 ms) | direct, ~0 overhead |
+| **Tick → placeOrder total** | **~20–50 µs** | **~4–8 µs** |
+
+---
+
 ## License
 
 Private. All rights reserved.
