@@ -44,6 +44,12 @@ bool ThetaDataClient::connect(const char* host, uint16_t port) {
     _frameAccumLen = 0;
     _connected.store(true, std::memory_order_release);
 
+    // Join any thread left over from a previous connection that the server
+    // dropped (recvLoop clears _connected itself on a socket error), so we
+    // never assign over a still-joinable std::thread — which would call
+    // std::terminate() on reconnect.
+    if (_recvThread.joinable())
+        _recvThread.join();
     _recvThread = std::thread([this] { recvLoop(); });
     // TIME_CRITICAL / SCHED_FIFO 99: market data must never be preempted.
     plat_thread_realtime(_recvThread.native_handle());
@@ -55,7 +61,12 @@ bool ThetaDataClient::connect(const char* host, uint16_t port) {
 }
 
 void ThetaDataClient::disconnect() {
-    if (!_connected.exchange(false)) return;
+    // NOTE: do not early-return based on _connected. When the server closes the
+    // connection, recvLoop() sets _connected=false itself and exits, leaving
+    // _recvThread joinable. Returning here would skip the join() below and the
+    // thread would be destroyed while joinable -> std::terminate(). Always run
+    // the close + join; both steps are idempotent on repeated calls.
+    _connected.store(false);
     if (_sock != INVALID_SOCK) {
         plat_shutdown(_sock);
         plat_close_socket(_sock);
