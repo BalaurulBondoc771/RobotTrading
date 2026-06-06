@@ -44,7 +44,7 @@ void EngineProxy::disconnect() {
 }
 
 bool EngineProxy::sendCommand(const char* json) noexcept {
-    if (!_connected.load() || _sock == INVALID_SOCKET) return false;
+    if (!_connected.load() || _sock == INVALID_SOCK) return false;
     // Protocol: each command is one JSON line
     char buf[2048];
     int n = snprintf(buf, sizeof(buf), "%s\n", json);

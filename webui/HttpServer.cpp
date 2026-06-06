@@ -353,7 +353,11 @@ void HttpServer::handleClient(socket_t s) {
             int bodyInHeader = total - (int)(bodyStart - req);
             // Read remaining body if needed
             while (bodyInHeader < contentLength && total < (int)sizeof(req)-1) {
-                int r = recv(s, req + total, contentLength - bodyInHeader, 0);
+                int want = contentLength - bodyInHeader;
+                int room = (int)sizeof(req) - 1 - total;   // never write past req[]
+                if (want > room) want = room;
+                if (want <= 0) break;
+                int r = recv(s, req + total, want, 0);
                 if (r <= 0) break;
                 total += r; bodyInHeader += r;
             }

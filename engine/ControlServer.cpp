@@ -140,9 +140,14 @@ void ControlServer::clientLoop(socket_t s) {
         }
     }
 
-    plat_close_socket(s);
+    // Remove from the list and close under the mutex, but only if stop() hasn't
+    // already done it — guards against erase(end()) UB and a double-close of s.
     std::lock_guard<std::mutex> lk(_clientsMux);
-    _clients.erase(std::find(_clients.begin(), _clients.end(), s));
+    auto it = std::find(_clients.begin(), _clients.end(), s);
+    if (it != _clients.end()) {
+        _clients.erase(it);
+        plat_close_socket(s);
+    }
 }
 
 // ============================================================

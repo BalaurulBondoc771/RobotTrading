@@ -205,11 +205,15 @@ bool ThetaDataClient::unwatch(const char* key) noexcept {
 // No heap allocation, no locks.
 // ============================================================
 void ThetaDataClient::recvLoop() noexcept {
-    int acc = 0; // accumulated bytes in _frameAccum
+    int acc    = 0; // accumulated raw bytes in _frameAccum
+    int asmLen = 0; // reassembled message bytes in _msgBuf across fragmented frames
 
     while (_connected.load(std::memory_order_relaxed)) {
         int space = (int)sizeof(_frameAccum) - acc - 1;
-        if (space <= 0) { acc = 0; continue; }
+        // Buffer full without a complete frame is only reachable on a malformed
+        // stream (a conformant frame always fits — see the size guard below).
+        // Drop the connection rather than silently discarding buffered bytes.
+        if (space <= 0) { _connected.store(false); break; }
 
         int r = recv(_sock, _frameAccum + acc, space, 0);
         if (r <= 0) { _connected.store(false); break; }
@@ -220,41 +224,57 @@ void ThetaDataClient::recvLoop() noexcept {
             const uint8_t* p     = (uint8_t*)_frameAccum + consumed;
             int            avail = acc - consumed;
 
-            uint8_t opcode = p[0] & 0x0F;
-            bool    masked = (p[1] & 0x80) != 0;
-            int     payLen = p[1] & 0x7F;
-            int     hdrLen = 2;
+            uint8_t  opcode = p[0] & 0x0F;
+            bool     fin    = (p[0] & 0x80) != 0;
+            bool     masked = (p[1] & 0x80) != 0;
+            uint64_t payLen = p[1] & 0x7F;
+            int      hdrLen = 2;
 
             if (payLen == 126) {
                 if (avail < 4) break;
-                payLen = ((int)p[2] << 8) | p[3];
+                payLen = ((uint64_t)p[2] << 8) | p[3];
                 hdrLen = 4;
             } else if (payLen == 127) {
                 if (avail < 10) break;
-                payLen = (int)(((uint64_t)p[2]<<56)|((uint64_t)p[3]<<48)|
-                               ((uint64_t)p[4]<<40)|((uint64_t)p[5]<<32)|
-                               ((uint64_t)p[6]<<24)|((uint64_t)p[7]<<16)|
-                               ((uint64_t)p[8]<<8) |(uint64_t)p[9]);
+                payLen = ((uint64_t)p[2]<<56)|((uint64_t)p[3]<<48)|
+                         ((uint64_t)p[4]<<40)|((uint64_t)p[5]<<32)|
+                         ((uint64_t)p[6]<<24)|((uint64_t)p[7]<<16)|
+                         ((uint64_t)p[8]<<8) |(uint64_t)p[9];
                 hdrLen = 10;
             }
 
-            int totalLen = hdrLen + (masked ? 4 : 0) + payLen;
-            if (avail < totalLen) break; // incomplete frame, wait for more data
+            // 64-bit math throughout: a length that cannot fit the buffer can
+            // never complete, so bail instead of truncating into a negative int
+            // (which previously indexed _msgBuf out of bounds).
+            uint64_t frameTotal = (uint64_t)hdrLen + (masked ? 4u : 0u) + payLen;
+            if (frameTotal > (uint64_t)sizeof(_frameAccum)) { _connected.store(false); return; }
+            if ((uint64_t)avail < frameTotal) break; // incomplete frame, wait for more
+            int totalLen = (int)frameTotal;           // safe: bounded above
 
             if (opcode == 0x01 || opcode == 0x00 || opcode == 0x02) {
-                // Text / continuation / binary
+                // Text / binary / continuation — append this fragment and only
+                // dispatch once FIN marks the final frame (RFC6455 fragmentation).
                 const char*    payload = (char*)p + hdrLen + (masked ? 4 : 0);
                 const uint8_t* maskKey = masked ? p + hdrLen : nullptr;
-                int msgLen = (payLen < (int)sizeof(_msgBuf) - 1) ? payLen : (int)sizeof(_msgBuf) - 1;
+
+                int pl = (int)payLen;
+                if (asmLen + pl > (int)sizeof(_msgBuf) - 1)
+                    pl = (int)sizeof(_msgBuf) - 1 - asmLen; // clamp; never overflow
+                if (pl < 0) pl = 0;
 
                 if (masked && maskKey) {
-                    for (int i = 0; i < msgLen; ++i)
-                        _msgBuf[i] = payload[i] ^ maskKey[i & 3];
+                    for (int i = 0; i < pl; ++i)
+                        _msgBuf[asmLen + i] = payload[i] ^ maskKey[i & 3];
                 } else {
-                    memcpy(_msgBuf, payload, msgLen);
+                    memcpy(_msgBuf + asmLen, payload, pl);
                 }
-                _msgBuf[msgLen] = '\0';
-                processMessage(_msgBuf, msgLen);
+                asmLen += pl;
+
+                if (fin) {
+                    _msgBuf[asmLen] = '\0';
+                    processMessage(_msgBuf, asmLen);
+                    asmLen = 0;
+                }
 
             } else if (opcode == 0x09) {
                 // Ping → Pong (masked, empty payload)

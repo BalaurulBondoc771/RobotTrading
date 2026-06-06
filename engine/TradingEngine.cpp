@@ -513,9 +513,6 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
     if (params.entryMode == 2 &&
         std::abs(stockBid - _lastProcessedBid) < params.spotSens) return;
 
-    // Commit new bid before entering the lock — eliminates one write from the locked section.
-    if (params.entryMode == 2) _lastProcessedBid = stockBid;
-
     // Read clock before acquiring the lock — removes a syscall from the critical section.
     const auto now = Clock::now();
     DeferredLog dlog;
@@ -524,6 +521,11 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
 
         if (stockAsk <= 0 || stockBid <= 0 || std::isnan(stockAsk) ||
             std::isnan(stockBid) || stockAsk > params.maxSafePrice) return;
+
+        // Advance the Mode-2 pre-filter baseline only after the tick is known
+        // valid — a transient bad/over-cap ask must not move _lastProcessedBid,
+        // or the spotSens filter would suppress later valid ticks at this bid.
+        if (params.entryMode == 2) _lastProcessedBid = stockBid;
 
         const bool isCall = _isCall;
         const double mid  = (stockBid + stockAsk) * 0.5;
@@ -560,7 +562,7 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
                     stopStrategyLocked("Edge lost (Mode 1)");
             }
         } else {
-            // Mode 2: _lastProcessedBid already committed before the lock
+            // Mode 2: _lastProcessedBid was committed above, after the validity gate
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastEntryModTime).count();
             if (ms > params.updateDelayMs) {
                 int activeId = _activeEntryOrderId.load(std::memory_order_relaxed);
@@ -661,7 +663,7 @@ TradingEngine::DeferredLog TradingEngine::executeHedgeActual(double optShares) n
     if (_isCall)
         limitPrice = (sAsk > 0) ? sAsk - params.hedgeOffset : sBid;
     else
-        limitPrice = (sAsk > 0) ? sAsk + params.hedgeOffset : sAsk;
+        limitPrice = (sAsk > 0) ? sAsk + params.hedgeOffset : sBid;
     double safePx = std::round(limitPrice * 100.0) / 100.0;
 
     double qty = optShares * params.hedgeQty;
