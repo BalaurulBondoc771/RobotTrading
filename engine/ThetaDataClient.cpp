@@ -374,7 +374,10 @@ void ThetaDataClient::processMessage(const char* msg, int len) noexcept {
         if (*p == '"') {
             // --- string value ---
             const char* vs = ++p;
-            while (p < end && *p != '"') ++p;
+            while (p < end && *p != '"') {
+                if (*p == '\\' && p + 1 < end) ++p; // skip escaped char so \" doesn't end the value early
+                ++p;
+            }
             int vl = (int)(p - vs);
             if (p < end) ++p;
 

@@ -241,7 +241,7 @@ private:
     // ------------------------------------------------------------------
     // ORDER ID — atomic counter, no lock needed
     // ------------------------------------------------------------------
-    alignas(64) std::atomic<int> _nextOrderId{0};
+    alignas(64) std::atomic<int> _nextOrderId{1};  // start at 1: id 0 is the "no active order" sentinel
                 std::atomic<int> _activeEntryOrderId{0};
                 std::atomic<int> _lastEntryOrderId{0};
                 std::atomic<int> _activeHedgeOrderId{0};

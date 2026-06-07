@@ -37,6 +37,10 @@ TradingEngine::~TradingEngine() {
 // ============================================================
 
 bool TradingEngine::connectIB(const char* host, int tradePort) {
+    // Tear down any prior connection first (joins stale reader threads and frees
+    // their EReaders) so reconnecting after a drop never reassigns over a
+    // joinable std::thread (-> std::terminate) or leaks an EReader.
+    disconnectIB();
     _clientId = rand() % 9000 + 1000;
 
     logf("IB connecting DUAL-SOCKET (clientId=%d)...", _clientId);
@@ -112,16 +116,19 @@ bool TradingEngine::connectIB(const char* host, int tradePort) {
 }
 
 void TradingEngine::disconnectIB() {
-    if (_tradeClient && _tradeClient->isConnected()) {
-        _tradeClient->eDisconnect();
-        _tradeSignal.issueSignal();
-    }
-    if (_infoClient && _infoClient->isConnected()) {
-        _infoClient->eDisconnect();
-        _infoSignal.issueSignal();
-    }
+    // eDisconnect + issueSignal are safe/idempotent even if already down. The
+    // reader threads block in waitForSignal(), so we must ALWAYS signal them
+    // (not only when isConnected()) or the joins below could hang after a
+    // server-side drop. Delete the EReaders only after the threads have stopped
+    // so a later connectIB() recreates them without leaking or using a freed one.
+    if (_tradeClient) _tradeClient->eDisconnect();
+    _tradeSignal.issueSignal();
+    if (_infoClient) _infoClient->eDisconnect();
+    _infoSignal.issueSignal();
     if (_tradeThread.joinable()) _tradeThread.join();
     if (_infoThread.joinable())  _infoThread.join();
+    delete _tradeReader; _tradeReader = nullptr;
+    delete _infoReader;  _infoReader  = nullptr;
 }
 
 bool TradingEngine::connectIQ(const char* host, uint16_t port) {
@@ -343,7 +350,6 @@ bool TradingEngine::startStrategy() {
     _lastProcessedBid         = 0;
     _lastEntryPriceSent       = 0;
     _lastEntryModTime         = {};
-    _processedExecIds.clear();
 
     // Stamp qty into the pre-built templates now that it is known.
     _entryOrderTemplate.totalQuantity = _activeOptQty;
@@ -352,6 +358,7 @@ bool TradingEngine::startStrategy() {
         SpinLockGuard hg(_hedgeLock);
         _initialPosQty   = _lastKnownOptQty;
         _lastOptionFillTime = {};
+        _processedExecIds.clear();   // cleared under _hedgeLock (matches execDetails dedup)
     }
 
     _activeEntryOrderId.store(0);
@@ -687,8 +694,10 @@ TradingEngine::DeferredLog TradingEngine::executeHedgeActual(double optShares) n
 // ============================================================
 
 void TradingEngine::nextValidId(int orderId) {
-    if (orderId > _nextOrderId.load())
-        _nextOrderId.store(orderId);
+    // Atomic max — a non-atomic load-then-store could race getNextOrderId().
+    int cur = _nextOrderId.load(std::memory_order_relaxed);
+    while (orderId > cur &&
+           !_nextOrderId.compare_exchange_weak(cur, orderId, std::memory_order_relaxed)) {}
 }
 
 void TradingEngine::currentTime(long long /*time*/) {
@@ -730,10 +739,14 @@ void TradingEngine::error(int id, time_t /*errorTime*/, int errorCode,
         bool isFatal = (errorCode == 201 || errorCode == 202 ||
                         errorCode == 104 || errorCode == 203 || errorCode == 399);
         if (isFatal) {
-            if (id == _activeEntryOrderId.load()) {
-                _activeEntryOrderId.store(0);
-                stopStrategy("IBKR rejected order");
-            } else if (id == _activeHedgeOrderId.load()) {
+            // Hold _processLock so the compare-and-clear cannot race the order
+            // placement path (which stores _activeEntryOrderId under the same
+            // lock). Use stopStrategyLocked since we already hold the lock; it
+            // also exchanges _activeEntryOrderId to 0 and cancels the order.
+            SpinLockGuard guard(_processLock);
+            if (id == _activeEntryOrderId.load(std::memory_order_relaxed)) {
+                stopStrategyLocked("IBKR rejected order");
+            } else if (id == _activeHedgeOrderId.load(std::memory_order_relaxed)) {
                 _activeHedgeOrderId.store(0);
             }
         }
@@ -742,16 +755,20 @@ void TradingEngine::error(int id, time_t /*errorTime*/, int errorCode,
 
 void TradingEngine::execDetails(int /*reqId*/, const Contract& contract,
                                  const Execution& exec) {
-    // Dedup: the same execution can arrive more than once
-    if (_processedExecIds.count(exec.execId)) return;
+    // Dedup: the same execution can arrive more than once. _processedExecIds is
+    // also cleared by startStrategy under _hedgeLock, so read it under the lock.
+    { SpinLockGuard hg(_hedgeLock); if (_processedExecIds.count(exec.execId)) return; }
 
     bool isOurEntry = (exec.orderId == (long long)_lastEntryOrderId.load() &&
                        _lastEntryOrderId.load() != 0);
     if (!isOurEntry && _isStrategyRunning.load() && _contractsSet.load(std::memory_order_relaxed)) {
-        // Match by contract attributes as fallback
+        // Match by contract attributes as fallback — must include the expiry, or
+        // a same-strike/right fill on a DIFFERENT expiration would be miscounted
+        // as our entry and trigger a spurious hedge.
         if (contract.symbol == _optionContract.symbol &&
             std::abs(contract.strike - _optionContract.strike) < 0.001 &&
             contract.right == _optionContract.right &&
+            contract.lastTradeDateOrContractMonth == _optionContract.lastTradeDateOrContractMonth &&
             exec.side == "BOT")
             isOurEntry = true;
     }

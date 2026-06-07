@@ -17,8 +17,12 @@ static const char* jFindVal(const char* j, int n, const char* key) noexcept {
     for (int i = 0; i + klen + 2 < n; ++i) {
         if (j[i] == '"' && memcmp(j+i+1, key, klen)==0 && j[i+1+klen]=='"') {
             int k = i + klen + 2;
-            while (k < n && (j[k]==':' || j[k]==' ')) ++k;
-            if (k < n) return j + k;
+            while (k < n && j[k]==' ') ++k;          // skip spaces before the colon
+            if (k < n && j[k]==':') {                // require a real "key": — not a value that looks like a key
+                ++k;
+                while (k < n && j[k]==' ') ++k;
+                if (k < n) return j + k;
+            }
         }
     }
     return nullptr;
@@ -125,17 +129,23 @@ void ControlServer::clientLoop(socket_t s) {
     char buf[4096];
     char line[4096];
     int  lineLen = 0;
+    bool lineOverflow = false;   // set once a line exceeds the buffer -> drop it
 
     while (_running.load()) {
         int r = recv(s, buf, sizeof(buf)-1, 0);
         if (r <= 0) break;
         for (int i = 0; i < r; ++i) {
             if (buf[i] == '\n') {
-                line[lineLen] = '\0';
-                if (lineLen > 2) handleCommand(line, lineLen);
+                if (!lineOverflow && lineLen > 2) {
+                    line[lineLen] = '\0';
+                    handleCommand(line, lineLen);
+                }
                 lineLen = 0;
+                lineOverflow = false;
             } else if (lineLen < (int)sizeof(line)-1) {
                 line[lineLen++] = buf[i];
+            } else {
+                lineOverflow = true; // oversized line: discard rather than run a truncated command
             }
         }
     }
