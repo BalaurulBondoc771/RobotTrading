@@ -779,7 +779,7 @@ void TradingEngine::execDetails(int /*reqId*/, const Contract& contract,
     if (isOurEntry) {
         SpinLockGuard hg(_hedgeLock);
         _processedExecIds.insert(exec.execId);
-        _sensorExecShares += exec.shares;
+        _sensorExecShares += DecimalFunctions::decimalToDouble(exec.shares);
         if (_lastOptionFillTime == TimePoint{}) _lastOptionFillTime = Clock::now();
         // Release hedge lock before evaluateHedge (it re-acquires)
     }
