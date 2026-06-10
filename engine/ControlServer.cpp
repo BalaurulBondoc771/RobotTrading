@@ -254,19 +254,23 @@ void ControlServer::broadcastChain() {
     json.reserve(8192);
     json = "{\"type\":\"chain\",\"rows\":[";
 
-    std::lock_guard<std::mutex> chainLk(_eng.chainMutex);
-    for (size_t i = 0; i < _eng.chainRows.size(); ++i) {
-        const ChainRowData& r = _eng.chainRows[i];
-        if (i) json += ',';
-        char row[256];
-        snprintf(row, sizeof(row),
-            "{\"strike\":%.4f,"
-            "\"callBid\":%.4f,\"callAsk\":%.4f,"
-            "\"putBid\":%.4f,\"putAsk\":%.4f}",
-            r.strike,
-            r.callBid.load(), r.callAsk.load(),
-            r.putBid.load(),  r.putAsk.load());
-        json += row;
+    // RCU snapshot — holding the shared_ptr keeps the rows alive even if the
+    // engine publishes a new chain while we serialize this one.
+    auto snap = _eng.chainSnapshot();
+    if (snap) {
+        for (size_t i = 0; i < snap->rows.size(); ++i) {
+            const ChainRowData& r = snap->rows[i];
+            if (i) json += ',';
+            char row[256];
+            snprintf(row, sizeof(row),
+                "{\"strike\":%.4f,"
+                "\"callBid\":%.4f,\"callAsk\":%.4f,"
+                "\"putBid\":%.4f,\"putAsk\":%.4f}",
+                r.strike,
+                r.callBid.load(), r.callAsk.load(),
+                r.putBid.load(),  r.putAsk.load());
+            json += row;
+        }
     }
     json += "]}\n";
 
@@ -329,6 +333,9 @@ void ControlServer::handleCommand(const char* json, int len) {
     } else if (strcmp(cmd, "panic") == 0) {
         _eng.panicCancelAll();
 
+    } else if (strcmp(cmd, "closeall") == 0) {
+        _eng.closeAllPositionsMKT();
+
     } else if (strcmp(cmd, "setparam") == 0) {
         char key[32]; jStr(json, len, "key", key, sizeof(key));
         double value = jDbl(json, len, "value");
@@ -345,12 +352,36 @@ void ControlServer::handleCommand(const char* json, int len) {
 
 void ControlServer::applyParam(const char* key, double value) {
     auto& p = _eng.params;
-    if      (strcmp(key, "entryMode")     == 0) p.entryMode     = (int)value;
-    else if (strcmp(key, "staticPrice")   == 0) p.staticPrice   = value;
-    else if (strcmp(key, "dynDiscount")   == 0) p.dynDiscount   = value;
-    else if (strcmp(key, "optQty")        == 0) p.optQty        = value;
-    else if (strcmp(key, "hedgeQty")      == 0) p.hedgeQty      = value;
-    else if (strcmp(key, "updateDelayMs") == 0) p.updateDelayMs = (int)value;
-    else if (strcmp(key, "spotSens")      == 0) p.spotSens      = value;
-    else if (strcmp(key, "hedgeOffset")   == 0) p.hedgeOffset   = value;
+
+    // Structural params can't change mid-run: entryMode flips would switch the
+    // decision logic under a live order, and optQty/hedgeQty are stamped into
+    // templates and hedge accounting at start.
+    bool running = _eng.disp.strategyRunning.load();
+    bool structural = strcmp(key, "entryMode") == 0 ||
+                      strcmp(key, "optQty")    == 0 ||
+                      strcmp(key, "hedgeQty")  == 0;
+    if (running && structural) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "REFUSED: %s cannot change while strategy is running", key);
+        broadcastLog(buf, true);
+        return;
+    }
+
+    if      (strcmp(key, "entryMode")       == 0) p.entryMode       = (int)value;
+    else if (strcmp(key, "staticPrice")     == 0) p.staticPrice     = value;
+    else if (strcmp(key, "dynDiscount")     == 0) p.dynDiscount     = value;
+    else if (strcmp(key, "optQty")          == 0) p.optQty          = value;
+    else if (strcmp(key, "hedgeQty")        == 0) p.hedgeQty        = value;
+    else if (strcmp(key, "updateDelayMs")   == 0) p.updateDelayMs   = (int)value;
+    else if (strcmp(key, "spotSens")        == 0) p.spotSens        = value;
+    else if (strcmp(key, "hedgeOffset")     == 0) p.hedgeOffset     = value;
+    else if (strcmp(key, "maxSafePrice")    == 0) p.maxSafePrice    = value;
+    else if (strcmp(key, "tickMode")        == 0) p.tickMode        = (int)value;
+    else if (strcmp(key, "staleMs")         == 0) p.staleMs         = (int)value;
+    else if (strcmp(key, "hedgeChaseMs")    == 0) p.hedgeChaseMs    = (int)value;
+    else if (strcmp(key, "maxHedgeChases")  == 0) p.maxHedgeChases  = (int)value;
+    else if (strcmp(key, "maxHedgeRetries") == 0) p.maxHedgeRetries = (int)value;
+    else if (strcmp(key, "maxOptQty")       == 0) p.maxOptQty       = value;
+    else if (strcmp(key, "maxOrdersPerRun") == 0) p.maxOrdersPerRun = (int)value;
+    else if (strcmp(key, "maxConsecRejects")== 0) p.maxConsecRejects= (int)value;
 }

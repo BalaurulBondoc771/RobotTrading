@@ -79,10 +79,11 @@ void ThetaDataClient::disconnect() {
 // RFC 6455 WebSocket opening handshake — client side only.
 // We use a fixed Sec-WebSocket-Key; the server's Accept header is not validated
 // since we're a dedicated single-connection client.
+// Theta Terminal v2 serves the stream at /v1/events (single connection allowed).
 bool ThetaDataClient::wsHandshake(const char* host, uint16_t port) noexcept {
     char req[512];
     snprintf(req, sizeof(req),
-        "GET / HTTP/1.1\r\n"
+        "GET /v1/events HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
@@ -104,8 +105,8 @@ bool ThetaDataClient::wsHandshake(const char* host, uint16_t port) noexcept {
     return strstr(resp, "101") != nullptr;
 }
 
-// Send a masked WebSocket text frame.
-// Uses a 520-byte stack array so _cmdBuf stays available for callers.
+// Send a masked WebSocket text frame. Stack buffers only — safe to call
+// from multiple control threads concurrently.
 bool ThetaDataClient::wsSendText(const char* json) noexcept {
     int payLen = (int)strlen(json);
     if (payLen <= 0 || payLen > 510) return false;
@@ -170,34 +171,38 @@ bool ThetaDataClient::parseOptionKey(const char* key,
     return true;
 }
 
-void ThetaDataClient::buildSubscribeJson(const char* key, bool subscribe) noexcept {
-    // TODO: verify "STREAM"/"STOP" msg_type values against ThetaData docs.
-    // Some versions may use "subscribe"/"unsubscribe".
-    const char* msgType = subscribe ? "STREAM" : "STOP";
+// Theta Terminal v2 stream request: msg_type STREAM with add:true/false and a
+// nested contract object. Strike is in millicents, matching our key convention.
+void ThetaDataClient::buildSubscribeJson(char* out, int outSz,
+                                          const char* key, bool subscribe) noexcept {
     char root[16], exp[9], right;
     int  strikeMC = 0;
+    int  id = _streamReqId.fetch_add(1, std::memory_order_relaxed);
 
     if (parseOptionKey(key, root, sizeof(root), exp, sizeof(exp), &right, &strikeMC)) {
-        snprintf(_cmdBuf, sizeof(_cmdBuf),
-            "{\"msg_type\":\"%s\",\"sec_type\":\"OPTION\",\"req_type\":\"QUOTE\","
-            "\"root\":\"%s\",\"exp\":%s,\"strike\":%d,\"right\":\"%c\"}",
-            msgType, root, exp, strikeMC, right);
+        snprintf(out, outSz,
+            "{\"msg_type\":\"STREAM\",\"sec_type\":\"OPTION\",\"req_type\":\"QUOTE\","
+            "\"add\":%s,\"id\":%d,\"contract\":{\"root\":\"%s\",\"expiration\":%s,"
+            "\"strike\":%d,\"right\":\"%c\"}}",
+            subscribe ? "true" : "false", id, root, exp, strikeMC, right);
     } else {
-        snprintf(_cmdBuf, sizeof(_cmdBuf),
-            "{\"msg_type\":\"%s\",\"sec_type\":\"STOCK\",\"req_type\":\"QUOTE\","
-            "\"ticker\":\"%s\"}",
-            msgType, key);
+        snprintf(out, outSz,
+            "{\"msg_type\":\"STREAM\",\"sec_type\":\"STOCK\",\"req_type\":\"QUOTE\","
+            "\"add\":%s,\"id\":%d,\"contract\":{\"root\":\"%s\"}}",
+            subscribe ? "true" : "false", id, key);
     }
 }
 
 bool ThetaDataClient::watch(const char* key) noexcept {
-    buildSubscribeJson(key, true);
-    return wsSendText(_cmdBuf);
+    char buf[512];
+    buildSubscribeJson(buf, sizeof(buf), key, true);
+    return wsSendText(buf);
 }
 
 bool ThetaDataClient::unwatch(const char* key) noexcept {
-    buildSubscribeJson(key, false);
-    return wsSendText(_cmdBuf);
+    char buf[512];
+    buildSubscribeJson(buf, sizeof(buf), key, false);
+    return wsSendText(buf);
 }
 
 // ============================================================
@@ -423,13 +428,29 @@ void ThetaDataClient::processMessage(const char* msg, int len) noexcept {
                 if (memcmp(ks, "bid_size", 8) == 0) bidSz = (int)fast_atoll(vs, p);
                 break;
             case 10:
-                if (memcmp(ks, "last_price", 10) == 0) last = fast_atof(vs, p);
+                if      (memcmp(ks, "last_price", 10) == 0) last = fast_atof(vs, p);
+                else if (memcmp(ks, "expiration", 10) == 0) exp  = fast_atoll(vs, p);
                 break;
             }
         }
     }
 
-    if (strcmp(typeStr, "QUOTE") != 0) return;
+    if (strcmp(typeStr, "QUOTE") != 0) {
+        // Surface non-quote server messages (errors, stream req responses) so a
+        // failed subscription is never silent. Keepalives carry no "type" and
+        // are skipped; consecutive messages of the same type are logged once.
+        if (typeStr[0] && strcmp(typeStr, _lastNonQuoteType) != 0) {
+            strncpy(_lastNonQuoteType, typeStr, sizeof(_lastNonQuoteType) - 1);
+            _lastNonQuoteType[sizeof(_lastNonQuoteType) - 1] = '\0';
+            if (onLog) {
+                char b[192];
+                snprintf(b, sizeof(b), "[theta] %s: %.140s", typeStr, msg);
+                onLog(b);
+            }
+        }
+        return;
+    }
+    _lastNonQuoteType[0] = '\0';
 
     // "root" takes priority; fall back to "ticker" for stock-only feeds
     if (root[0] == '\0' && ticker[0] != '\0')

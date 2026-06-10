@@ -217,14 +217,61 @@ Navigate to `http://localhost:8080` in any browser.
 | `hedgeOffset` | `0.05` | Slippage offset for hedge limit price |
 | `optQty` | `1.0` | Option contracts to buy per entry |
 | `hedgeQty` | `100.0` | Stock shares per hedge order |
+| `tickMode` | `0` | `0` = nickel ticks above $3, `1` = penny ticks everywhere (penny-program classes like SPY) |
+| `staleMs` | `3000` | Watchdog: stop + cancel entry if no relevant tick for this long (`0` = off) |
+| `hedgeChaseMs` | `1500` | Reprice an unfilled hedge order after this long (`0` = no chase) |
+| `maxHedgeChases` | `3` | Limit-price chases before a hedge escalates to MKT |
+| `maxHedgeRetries` | `5` | Hedge re-placements after reject/cancel before the alarm fires |
+| `maxOptQty` | `10` | `startStrategy` refuses an `optQty` above this |
+| `maxOrdersPerRun` | `500` | Entry placements per strategy run (runaway-loop guard) |
+| `maxConsecRejects` | `3` | Consecutive fatal rejects → kill switch (global cancel) |
 
-Parameters are set at startup in `main.cpp` and can be changed at runtime via the UI.
+All parameters are `std::atomic` — they can be changed at runtime from the UI
+with no data race against the hot path. `entryMode`, `optQty` and `hedgeQty`
+are **structural** and rejected while the strategy is running.
 
 ### Mode 1 (Static price)
 Places a limit buy at `staticPrice`. Checks that `intrinsic_value - staticPrice >= dynDiscount` as a safety gate before placing.
 
 ### Mode 2 (Dynamic discount)
 Continuously tracks `target = intrinsic_value - dynDiscount`. Only processes a tick if the stock bid has moved by at least `spotSens`, eliminating ~85–90% of ticks before entering the spinlock.
+
+---
+
+## Safety systems
+
+The engine runs a dedicated **watchdog thread** (below-normal priority, 100 ms
+tick — zero impact on the hot path) that provides:
+
+- **Data-staleness stop** — if the strategy is running and no trading-relevant
+  quote has arrived for `staleMs`, the entry order is cancelled and the
+  strategy stops. A resting limit order priced off frozen quotes is pure
+  adverse selection once the market moves. The heartbeat is a relaxed atomic
+  counter incremented per tick (~5 ns, no clock call on the hot path).
+- **Feed-loss stop + auto-reconnect** — if ThetaData drops mid-run the strategy
+  stops immediately; the watchdog then reconnects once per second and restores
+  every subscription automatically.
+- **Hedge fill confirmation** — *placed is not filled*. Every hedge order is
+  tracked individually (`orderStatus` fills per order id). If a hedge is
+  rejected or cancelled with a shortfall, the uncovered quantity is re-placed
+  automatically (up to `maxHedgeRetries`, then a loud `HEDGE FAILED — MANUAL
+  ACTION REQUIRED` alarm). `HEDGE COMPLETE` is only reported when every share
+  is confirmed filled.
+- **Hedge chase** — an unfilled hedge limit order is repriced every
+  `hedgeChaseMs`, crossing the spread progressively; after `maxHedgeChases`
+  it escalates to a MKT order. An unfilled hedge is a naked options position.
+- **Kill switch** — `maxConsecRejects` consecutive fatal order rejections
+  trigger a global cancel and stop (something structural is wrong: margin,
+  permissions, contract definition).
+- **Risk gates** — `startStrategy` refuses `optQty > maxOptQty`;
+  `maxOrdersPerRun` caps entry placements per run so a bug in the update loop
+  can never hammer the broker.
+- **Close All (MKT)** — the UI button flattens every position reported by
+  `position()` with market orders after a global cancel.
+- **Audit journal** — every order placement/update, fill, rejection, stop and
+  panic is appended to `audit_YYYYMMDD.log` (timestamped, flushed per event,
+  written only outside spinlocks). The UI log is ephemeral; this file is the
+  record of what the engine actually did.
 
 ---
 
@@ -250,7 +297,33 @@ RobotTrading/
 │   ├── HttpServer.h/.cpp       HTTP/WebSocket server (:8080)
 │   └── EngineProxy.h/.cpp      Proxies commands to engine :7799
 │
+├── tests/
+│   └── test_thetadata.cpp      ThetaData client tests (mock WS server)
+│
 └── IBApi/                      IBKR TWS C++ API — place here manually (see above)
+```
+
+---
+
+## Testing
+
+`robottrading_tests` spins up a mock Theta Terminal v2 WebSocket server on
+localhost and validates the client end-to-end: handshake path (`/v1/events`),
+subscribe/unsubscribe JSON format (nested `contract`, `add:true/false`,
+millicent strikes), frame parsing (single, fragmented/continuation, 16-bit
+length, ping→pong) and quote decoding of the real nested
+`header`/`contract`/`quote` layout. It needs neither IBApi nor protobuf.
+
+```bash
+cmake --build build --config Release --target robottrading_tests
+build/Release/robottrading_tests.exe        # or: ctest --test-dir build -C Release
+```
+
+On Linux, race-condition hunting builds are available:
+
+```bash
+cmake -B build-tsan -DENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=Debug
+cmake -B build-asan -DENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug
 ```
 
 ---
@@ -447,6 +520,37 @@ Press **Ctrl+C** in the engine terminal (or send SIGTERM on Linux). The engine c
 ---
 
 ## Updates
+
+### 2026-06 hardening pass
+
+- **ThetaData protocol fixed against the real v2 docs** — the previous
+  subscribe messages (`msg_type STOP`, flat `exp` field, no `add`/`id`, no
+  nested `contract`, handshake on `/`) did not match Theta Terminal v2 and
+  would have subscribed nothing, silently. Now: `GET /v1/events`, nested
+  `contract` object, `add:true/false`, and the parser understands the nested
+  `header`/`contract`/`quote` response (including the `expiration` field).
+  Non-quote server messages (e.g. subscription errors) are surfaced in the log.
+- **Chain UAF fixed (RCU)** — `loadChain` used to rebuild the chain map/rows
+  while the recv thread read them lock-free → use-after-free under in-flight
+  quotes. Chains are now immutable `ChainSnapshot`s published via atomic
+  `shared_ptr` swap; readers pin the snapshot they're using.
+- **Hedge engine: placed ≠ filled** — per-order fill tracking, automatic
+  shortfall re-placement, chase/MKT escalation, alarm on retry exhaustion
+  (see *Safety systems*).
+- **Watchdog** — staleness stop, feed auto-reconnect, hedge chase, 1 Hz IB
+  ping (previously the ping was never initiated, and its callback would have
+  self-sustained at RTT period).
+- **All params atomic** + structural params locked while running; risk gates
+  (`maxOptQty`, `maxOrdersPerRun`, `maxConsecRejects` kill switch).
+- **Audit journal** (`audit_YYYYMMDD.log`) and a working **Close All (MKT)**.
+- **IB socket sends serialized** (`_ibSendLock`) — orders are placed from
+  three threads; `EClientSocket` is not thread-safe.
+- **BID64 quantity fix** — `Order::totalQuantity` is a BID64 `Decimal`
+  (`unsigned long long`); the previous raw `double` assignments would have
+  sent garbage quantities. All writes now go through
+  `DecimalFunctions::doubleToDecimal`.
+- **Tests** — mock-WS-server test suite for the ThetaData client; TSan/ASan
+  build options.
 
 ### C# → C++ rewrite: what changed and why
 

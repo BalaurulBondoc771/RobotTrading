@@ -101,12 +101,22 @@ td.ap{color:#2196f3!important;font-weight:bold}
   <div class="fld"><label>Delay ms</label><input id="p-dl" type="number" step="100" value="2000" onchange="sp('updateDelayMs',+this.value)"></div>
   <div class="fld"><label>Spot Sens</label><input id="p-ss" type="number" step="0.01" value="0.05" onchange="sp('spotSens',+this.value)"></div>
   <div class="fld"><label>Hdg Off</label><input id="p-ho" type="number" step="0.01" value="0.05" onchange="sp('hedgeOffset',+this.value)"></div>
+  <div class="fld"><label>Tick</label><select id="p-tk" onchange="sp('tickMode',+this.value)"><option value="0" selected>Nickel &gt;$3</option><option value="1">Penny (SPY)</option></select></div>
+</div>
+
+<div class="sec">
+  <div class="sec-title">Safety</div>
+  <div class="fld"><label>Stale ms</label><input id="p-sm" type="number" step="500" value="3000" onchange="sp('staleMs',+this.value)"></div>
+  <div class="fld"><label>Chase ms</label><input id="p-cm" type="number" step="100" value="1500" onchange="sp('hedgeChaseMs',+this.value)"></div>
+  <div class="fld"><label>Max Chase</label><input id="p-mc" type="number" step="1" value="3" onchange="sp('maxHedgeChases',+this.value)"></div>
+  <div class="fld"><label>Max Qty</label><input id="p-mq" type="number" step="1" value="10" onchange="sp('maxOptQty',+this.value)"></div>
 </div>
 
 <div class="sec">
   <div class="sec-title">Strategy</div>
   <div class="btn-row"><button class="btn" style="font-weight:bold" onclick="cmd('start')">▶ START</button><button class="btn d" onclick="cmd('stop')">■ STOP</button></div>
   <div style="margin-top:8px;text-align:center"><button class="btn panic" onclick="doPanic()">⚡ PANIC STOP</button></div>
+  <div style="margin-top:6px;text-align:center"><button class="btn d" onclick="doCloseAll()">✕ CLOSE ALL (MKT)</button></div>
 </div>
 
 </div><!-- /sidebar -->
@@ -254,6 +264,10 @@ function armContract(){
 
 function doPanic(){
   if(confirm('EMERGENCY STOP — cancel all orders?'))cmd('panic');
+}
+
+function doCloseAll(){
+  if(confirm('CLOSE ALL POSITIONS at MARKET — this sends real MKT orders. Continue?'))cmd('closeall');
 }
 </script></body></html>
 )HTML";

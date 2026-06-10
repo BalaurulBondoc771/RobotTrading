@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cstring>
 #include <cmath>
+#include <memory>
+#include <cstdio>
 
 // IBKR C++ TWS API headers (TWS API 9.79+, with protobuf support)
 #include "../IBApi/DefaultEWrapper.h"
@@ -119,6 +121,33 @@ using ChainMap = std::unordered_map<std::string, IqOptionMapInfo,
                                     TransparentStringHash, TransparentStringEqual>;
 
 // -----------------------------------------------------------------------
+// Immutable-structure chain snapshot (RCU pattern).
+// loadChain() builds a complete new snapshot and publishes it with an atomic
+// shared_ptr store; the ThetaData recv thread loads the pointer per quote and
+// writes only the atomic price fields inside rows. The old snapshot is freed
+// when its last reader drops the reference — no reader ever sees a vector
+// being cleared/reallocated under it.
+// -----------------------------------------------------------------------
+struct ChainSnapshot {
+    std::vector<ChainRowData> rows;
+    ChainMap                  map;   // symbol → pointer into rows (stable for snapshot lifetime)
+};
+
+// -----------------------------------------------------------------------
+// Append-only on-disk audit journal: every order placement/update, fill,
+// rejection and strategy start/stop. Independent of the UI log socket so a
+// session can always be reconstructed. Never called while a spinlock is held.
+// -----------------------------------------------------------------------
+class AuditLog {
+public:
+    ~AuditLog();
+    void write(const char* fmt, ...);
+private:
+    FILE*      _f = nullptr;
+    std::mutex _m;
+};
+
+// -----------------------------------------------------------------------
 // TradingEngine
 // Implements EWrapper so IBKR callbacks arrive directly into this class.
 // -----------------------------------------------------------------------
@@ -160,18 +189,35 @@ public:
     void closeAllPositionsMKT();
 
     // ------------------------------------------------------------------
-    // Tunable parameters (set before startStrategy)
+    // Tunable parameters. All atomic: written by the ControlServer thread at
+    // runtime while the hot path reads them — plain doubles would be a data
+    // race. Atomic loads compile to plain MOVs on x86, so the hot path cost
+    // is unchanged. entryMode/optQty changes are rejected while the strategy
+    // is running (see ControlServer::applyParam).
     // ------------------------------------------------------------------
     struct Params {
-        int    entryMode     = 2;      // 1 = static price, 2 = dynamic discount
-        double staticPrice   = 5.0;
-        double dynDiscount   = 0.10;
-        int    updateDelayMs = 2000;
-        double spotSens      = 0.05;
-        double hedgeOffset   = 0.05;
-        double maxSafePrice  = 1000.0;
-        double optQty        = 1.0;
-        double hedgeQty      = 100.0;
+        std::atomic<int>    entryMode{2};      // 1 = static price, 2 = dynamic discount
+        std::atomic<double> staticPrice{5.0};
+        std::atomic<double> dynDiscount{0.10};
+        std::atomic<int>    updateDelayMs{2000};
+        std::atomic<double> spotSens{0.05};
+        std::atomic<double> hedgeOffset{0.05};
+        std::atomic<double> maxSafePrice{1000.0};
+        std::atomic<double> optQty{1.0};
+        std::atomic<double> hedgeQty{100.0};
+
+        // Tick rounding: 0 = nickel above $3 (default), 1 = penny at all prices
+        // (penny-interval-program classes like SPY quote in pennies everywhere).
+        std::atomic<int>    tickMode{0};
+
+        // Safety / risk limits
+        std::atomic<int>    staleMs{3000};            // stop strategy if no relevant tick for this long (0 = off)
+        std::atomic<int>    hedgeChaseMs{1500};       // reprice an unfilled hedge after this long
+        std::atomic<int>    maxHedgeChases{3};        // limit-price chases before escalating to MKT
+        std::atomic<int>    maxHedgeRetries{5};       // re-placements after reject/cancel before alarm
+        std::atomic<double> maxOptQty{10.0};          // refuse to start with optQty above this
+        std::atomic<int>    maxOrdersPerRun{500};     // entry placements per strategy run (runaway guard)
+        std::atomic<int>    maxConsecRejects{3};      // consecutive fatal rejects -> global cancel
     } params;
 
     // ------------------------------------------------------------------
@@ -190,8 +236,11 @@ public:
         std::atomic<int>    ibPingMs{0};
     } disp;
 
-    // Chain rows — written once at load time, then live fields updated via atomics
-    std::vector<ChainRowData> chainRows;
+    // Current chain snapshot (may be null before the first loadChain).
+    // Readers hold the returned shared_ptr for the duration of their access.
+    std::shared_ptr<const ChainSnapshot> chainSnapshot() const {
+        return std::atomic_load_explicit(&_chainSnap, std::memory_order_acquire);
+    }
 
     // Expiration list populated after searchContract
     std::vector<std::string> expirations;
@@ -200,8 +249,8 @@ public:
     std::atomic<int> chainVersion{0};
     std::atomic<int> expVersion{0};
 
-    // Protects chainRows and expirations structural access (not atomic fields within rows).
-    // Held briefly by loadChain() and ControlServer status broadcast; never on hot path.
+    // Protects the expirations vector (chain rows are published via chainSnapshot()).
+    // Held briefly; never on hot path.
     std::mutex chainMutex;
 
     // Managed accounts
@@ -226,6 +275,10 @@ private:
     // ThetaData
     // ------------------------------------------------------------------
     ThetaDataClient _thetaClient;
+    std::atomic<bool> _iqShouldBeConnected{false}; // user intent — drives watchdog auto-reconnect
+    char       _iqHost[64] = "127.0.0.1";
+    uint16_t   _iqPort     = 25520;
+    std::mutex _iqSymMutex;   // protects _activeIqSymbols (control threads + watchdog)
 
     // ------------------------------------------------------------------
     // HOT PRICE STATE — each pair on its own cache line to prevent false sharing
@@ -244,35 +297,64 @@ private:
     alignas(64) std::atomic<int> _nextOrderId{1};  // start at 1: id 0 is the "no active order" sentinel
                 std::atomic<int> _activeEntryOrderId{0};
                 std::atomic<int> _lastEntryOrderId{0};
-                std::atomic<int> _activeHedgeOrderId{0};
-                std::atomic<int> _lastHedgeOrderId{0};
 
     // ------------------------------------------------------------------
     // STRATEGY STATE — under _processLock or _hedgeLock respectively
     // ------------------------------------------------------------------
     alignas(64) std::atomic<bool> _isStrategyRunning{false};
 
-    // Protected by _processLock
-    double    _activeOptQty          = 0.0;
+    // _activeOptQty: written at startStrategy (_processLock), read by both the
+    // entry path (_processLock) and the hedge path (_hedgeLock) — atomic so the
+    // cross-lock read is well-defined.
+    std::atomic<double> _activeOptQty{0.0};
+
+    // Protected by _processLock (atomic: the Mode-2 pre-filter reads it before
+    // taking the lock, and startStrategy resets it from the control thread)
+    std::atomic<double> _lastProcessedBid{0.0};
     double    _lastEntryPriceSent    = 0.0;
-    double    _lastProcessedBid      = 0.0;
     TimePoint _lastEntryModTime      = {};
 
     // Protected by _hedgeLock
     double    _sensorExecShares      = 0.0;
     double    _sensorOrderStatusFilled = 0.0;
     double    _sensorPortfolioDiff   = 0.0;
-    double    _totalHedgedForEntry   = 0.0;
-    bool      _isHedgeComplete       = false;
+    double    _hedgePlacedOptQty     = 0.0;  // option-contract equivalents covered by PLACED hedge orders
+    double    _hedgeFilledShares     = 0.0;  // stock shares actually FILLED across hedge orders
+    int       _hedgeRetries          = 0;    // re-placements after reject/cancel (this run)
+    bool      _hedgeAlarmed          = false;// retry budget exhausted — manual action required
+    bool      _entryFillComplete     = false;// full optQty confirmed filled
+    bool      _isHedgeComplete       = false;// all hedge SHARES confirmed filled
     double    _initialPosQty         = 0.0;
     double    _lastKnownOptQty       = 0.0;
     TimePoint _lastOptionFillTime    = {};
+
+    // Per-hedge-order accounting — placed vs filled, for shortfall retry and
+    // the watchdog chase. Under _hedgeLock.
+    struct HedgeOrderRec {
+        double    qtyShares    = 0.0;
+        double    filledShares = 0.0;
+        double    lmtPrice     = 0.0;
+        int       chases       = 0;
+        bool      open         = false;
+        TimePoint placedAt     = {};
+    };
+    std::unordered_map<int, HedgeOrderRec> _hedgeOrders;
+
+    // ------------------------------------------------------------------
+    // RISK COUNTERS
+    // ------------------------------------------------------------------
+    std::atomic<int> _entryOrdersThisRun{0}; // runaway guard vs maxOrdersPerRun
+    std::atomic<int> _consecRejects{0};      // kill switch vs maxConsecRejects
 
     // ------------------------------------------------------------------
     // SPINLOCKS — each on its own cache line (see SpinLock.h)
     // ------------------------------------------------------------------
     SpinLock _processLock;  // guards price processing & order placement
     SpinLock _hedgeLock;    // guards hedge accounting
+    // Serializes all sends on the IBKR sockets. EClientSocket is not
+    // thread-safe and orders are placed from three threads (ThetaData recv,
+    // IBKR reader callbacks, watchdog chase). Uncontended cost ~10 ns.
+    SpinLock _ibSendLock;
 
     // ------------------------------------------------------------------
     // CONTRACTS — set once by armContract(), then read-only during trading
@@ -306,8 +388,11 @@ private:
     std::unordered_map<std::string, ChainEntry> _chainData;
     SpinLock _chainDataLock;
 
-    ChainMap                _iqChainMap;       // symbol → row, transparent lookup
-    std::unordered_set<std::string> _activeIqSymbols;
+    // Published chain snapshot — see ChainSnapshot. Accessed only through
+    // std::atomic_load / std::atomic_store.
+    std::shared_ptr<ChainSnapshot> _chainSnap;
+
+    std::unordered_set<std::string> _activeIqSymbols;  // under _iqSymMutex
 
     int _searchReqId      = 9000;
     int _lastChainReqId   = 0;
@@ -315,8 +400,32 @@ private:
 
     std::unordered_set<std::string> _processedExecIds; // dedup exec callbacks
 
-    // Ping timing
-    TimePoint _ibPingReqTime = {};
+    // ------------------------------------------------------------------
+    // ACCOUNT POSITIONS — fed by position() callback; used by closeAllPositionsMKT
+    // ------------------------------------------------------------------
+    struct PosRec { Contract con; double qty = 0.0; };
+    std::unordered_map<std::string, PosRec> _positions;  // under _posMutex
+    std::mutex _posMutex;
+
+    // ------------------------------------------------------------------
+    // WATCHDOG — below-normal-priority thread: data staleness stop,
+    // ThetaData auto-reconnect, hedge chase, IB ping initiation.
+    // ------------------------------------------------------------------
+    std::thread            _watchThread;
+    std::atomic<bool>      _watchRun{false};
+    std::atomic<uint64_t>  _tickSeq{0};        // ++ per trading-relevant quote (relaxed)
+    std::atomic<long long> _ibPingReqNs{0};    // steady_clock ns of last reqCurrentTime
+
+    // Stop events happen while _processLock is held; the audit write (fprintf)
+    // must not run inside a spinlock, so the reason is parked here and flushed
+    // by the watchdog thread.
+    char              _stopReason[96] = {};
+    std::atomic<bool> _stopAuditPending{false};
+
+    // ------------------------------------------------------------------
+    // AUDIT JOURNAL
+    // ------------------------------------------------------------------
+    AuditLog _audit;
 
     // ------------------------------------------------------------------
     // CORE HOT-PATH METHODS
@@ -336,10 +445,18 @@ private:
     void evaluateHedge() noexcept;
     DeferredLog executeHedgeActual(double optShares) noexcept;
 
+    // Watchdog internals
+    void watchdogLoop() noexcept;
+    void chaseHedges(TimePoint now) noexcept;
+
+    // Fire a DeferredLog after the lock that produced it was released:
+    // UI log + audit journal.
+    void emitDeferred(const DeferredLog& d);
+
     // ------------------------------------------------------------------
     // HELPERS
     // ------------------------------------------------------------------
-    static double getLegalOptionPrice(double price) noexcept;
+    double getLegalOptionPrice(double price) const noexcept;
     double getCurrentSpot() const noexcept;
     std::string buildThetaOptionKey(const char* sym, const char* ibkrExpiry, char right, double strike) const;
     int  getNextOrderId() noexcept;

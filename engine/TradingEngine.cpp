@@ -4,9 +4,48 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <algorithm>
 #include <sstream>
 #include <cctype>
+
+// ============================================================
+// AUDIT JOURNAL — append-only, daily file, flushed per event.
+// Events are rare (order placements, fills, stops), so a mutex +
+// fprintf + fflush is fine; it is never called under a spinlock.
+// ============================================================
+
+AuditLog::~AuditLog() {
+    std::lock_guard<std::mutex> lk(_m);
+    if (_f) { fclose(_f); _f = nullptr; }
+}
+
+void AuditLog::write(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lk(_m);
+    time_t t = time(nullptr);
+    tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    if (!_f) {
+        char name[64];
+        snprintf(name, sizeof(name), "audit_%04d%02d%02d.log",
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+        _f = fopen(name, "a");
+        if (!_f) return;
+    }
+    fprintf(_f, "%04d-%02d-%02d %02d:%02d:%02d | ",
+            tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+            tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    va_list va;
+    va_start(va, fmt);
+    vfprintf(_f, fmt, va);
+    va_end(va);
+    fputc('\n', _f);
+    fflush(_f);
+}
 
 // ============================================================
 // CONSTRUCTION / DESTRUCTION
@@ -17,19 +56,29 @@ TradingEngine::TradingEngine() {
     _infoClient  = new EClientSocket(this, &_infoSignal);
 
     // Pre-reserve all containers to avoid rehash/realloc during trading
-    _iqChainMap.reserve(4096);
     _activeIqSymbols.reserve(4096);
     _processedExecIds.reserve(256);
-    chainRows.reserve(2048);
+    _hedgeOrders.reserve(64);
+    _positions.reserve(64);
     expirations.reserve(128);
     _chainData.reserve(128);
+
+    _audit.write("ENGINE START");
+
+    _watchRun.store(true);
+    _watchThread = std::thread([this] { watchdogLoop(); });
+    plat_thread_below_norm(_watchThread.native_handle());
 }
 
 TradingEngine::~TradingEngine() {
+    // Stop the watchdog first — it touches _tradeClient and _thetaClient.
+    _watchRun.store(false);
+    if (_watchThread.joinable()) _watchThread.join();
     disconnectIB();
     disconnectIQ();
     delete _tradeReader; delete _tradeClient;
     delete _infoReader;  delete _infoClient;
+    _audit.write("ENGINE STOP");
 }
 
 // ============================================================
@@ -41,7 +90,9 @@ bool TradingEngine::connectIB(const char* host, int tradePort) {
     // their EReaders) so reconnecting after a drop never reassigns over a
     // joinable std::thread (-> std::terminate) or leaks an EReader.
     disconnectIB();
-    _clientId = rand() % 9000 + 1000;
+    // Clock-derived id: rand() without srand() returned the same sequence every
+    // run, so two engine instances would collide on the same clientId.
+    _clientId = (int)(Clock::now().time_since_epoch().count() % 9000) + 1000;
 
     logf("IB connecting DUAL-SOCKET (clientId=%d)...", _clientId);
 
@@ -92,6 +143,7 @@ bool TradingEngine::connectIB(const char* host, int tradePort) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     if (!_infoClient->eConnect(host, tradePort, _clientId + 1)) {
         log("IB: info socket connect FAILED");
+        disconnectIB();  // don't leave a half-connected state (trade socket up, info down)
         return false;
     }
     _infoReader = new EReader(_infoClient, &_infoSignal);
@@ -107,11 +159,13 @@ bool TradingEngine::connectIB(const char* host, int tradePort) {
     // Request account & positions after a brief settle
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
     if (_infoClient->isConnected()) {
+        SpinLockGuard g(_ibSendLock);
         _infoClient->reqManagedAccts();
         _infoClient->reqPositions();
     }
 
     log("IB DUAL-SOCKET ACTIVE");
+    _audit.write("IB CONNECTED %s:%d clientId=%d", host, tradePort, _clientId);
     return true;
 }
 
@@ -135,16 +189,29 @@ bool TradingEngine::connectIQ(const char* host, uint16_t port) {
     _thetaClient.setCallback([this](const char* sym, double bid, double ask, double last, int vol) {
         processIQData(sym, bid, ask, last, vol);
     });
+    _thetaClient.onLog = [this](const char* msg) { log(msg); };
     bool ok = _thetaClient.connect(host, port);
-    if (ok) log("ThetaData connected");
-    else     log("ThetaData connect FAILED — is ThetaTerminal running on port 25520?");
+    if (ok) {
+        // Remember the endpoint so the watchdog can auto-reconnect after a drop.
+        strncpy(_iqHost, host, sizeof(_iqHost) - 1);
+        _iqHost[sizeof(_iqHost) - 1] = '\0';
+        _iqPort = port;
+        _iqShouldBeConnected.store(true);
+        log("ThetaData connected");
+    } else {
+        log("ThetaData connect FAILED — is ThetaTerminal running on port 25520?");
+    }
     return ok;
 }
 
 void TradingEngine::disconnectIQ() {
-    for (const auto& s : _activeIqSymbols)
-        _thetaClient.unwatch(s.c_str());
-    _activeIqSymbols.clear();
+    _iqShouldBeConnected.store(false);  // user intent: watchdog must not reconnect
+    {
+        std::lock_guard<std::mutex> lk(_iqSymMutex);
+        for (const auto& s : _activeIqSymbols)
+            _thetaClient.unwatch(s.c_str());
+        _activeIqSymbols.clear();
+    }
     _thetaClient.disconnect();
 }
 
@@ -165,11 +232,15 @@ void TradingEngine::searchContract(const char* symbol) {
     for (char* c = _stockSymbol; *c; ++c) *c = (char)toupper(*c);
 
     { SpinLockGuard g(_chainDataLock); _chainData.clear(); }
-    expirations.clear();
+    {
+        std::lock_guard<std::mutex> lk(chainMutex);
+        expirations.clear();
+    }
 
     // Subscribe ThetaData to spot price for the underlying
     if (_thetaClient.isConnected()) {
         _thetaClient.watch(_stockSymbol);
+        std::lock_guard<std::mutex> lk(_iqSymMutex);
         _activeIqSymbols.insert(_stockSymbol);
     }
 
@@ -179,7 +250,10 @@ void TradingEngine::searchContract(const char* symbol) {
     req.secType  = "STK";
     req.exchange = "SMART";
     req.currency = "USD";
-    _infoClient->reqContractDetails(_searchReqId, req);
+    {
+        SpinLockGuard g(_ibSendLock);
+        _infoClient->reqContractDetails(_searchReqId, req);
+    }
     logf("Searching topology for %s ...", _stockSymbol);
 }
 
@@ -191,11 +265,14 @@ void TradingEngine::loadChain(const std::string& expiration, double spotFilterPc
     if (!_thetaClient.isConnected()) { log("ThetaData offline — cannot load chain"); return; }
 
     // Unsubscribe all previous chain symbols
-    for (const auto& s : _activeIqSymbols) {
-        if (s != _stockSymbol) _thetaClient.unwatch(s.c_str());
+    {
+        std::lock_guard<std::mutex> lk(_iqSymMutex);
+        for (const auto& s : _activeIqSymbols) {
+            if (s != _stockSymbol) _thetaClient.unwatch(s.c_str());
+        }
+        _activeIqSymbols.clear();
+        if (_stockSymbol[0]) _activeIqSymbols.insert(_stockSymbol);
     }
-    _activeIqSymbols.clear();
-    if (_stockSymbol[0]) _activeIqSymbols.insert(_stockSymbol);
 
     ChainEntry entry;
     {
@@ -215,33 +292,38 @@ void TradingEngine::loadChain(const std::string& expiration, double spotFilterPc
             [lo, hi](double s) { return s < lo || s > hi; }), strikes.end());
     }
 
-    {
-        // Take chainMutex before rebuilding chainRows — ControlServer reads this vector.
-        std::lock_guard<std::mutex> lk(chainMutex);
-        _iqChainMap.clear();
-        chainRows.clear();
-        chainRows.resize(strikes.size());
+    // Build a complete NEW snapshot off to the side, then publish it with a
+    // single atomic store (RCU). The recv thread may still hold the old
+    // snapshot via shared_ptr — it stays valid until the last reader drops it.
+    // This is what makes lock-free row updates in processIQData safe.
+    auto snap = std::make_shared<ChainSnapshot>();
+    snap->rows.resize(strikes.size());
+    snap->map.reserve(strikes.size() * 2 + 8);
 
-        for (int i = 0; i < (int)strikes.size(); ++i) {
-            ChainRowData& row = chainRows[i];
-            row.rowIndex = i;
-            row.strike   = strikes[i];
-            strncpy(row.expiration, expiration.c_str(), sizeof(row.expiration) - 1);
+    for (int i = 0; i < (int)strikes.size(); ++i) {
+        ChainRowData& row = snap->rows[i];
+        row.rowIndex = i;
+        row.strike   = strikes[i];
+        strncpy(row.expiration, expiration.c_str(), sizeof(row.expiration) - 1);
 
-            auto callOsi = buildThetaOptionKey(_stockSymbol, expiration.c_str(), 'C', strikes[i]);
-            auto putOsi  = buildThetaOptionKey(_stockSymbol, expiration.c_str(), 'P', strikes[i]);
-            strncpy(row.callOsi, callOsi.c_str(), sizeof(row.callOsi) - 1);
-            strncpy(row.putOsi,  putOsi.c_str(),  sizeof(row.putOsi)  - 1);
+        auto callOsi = buildThetaOptionKey(_stockSymbol, expiration.c_str(), 'C', strikes[i]);
+        auto putOsi  = buildThetaOptionKey(_stockSymbol, expiration.c_str(), 'P', strikes[i]);
+        strncpy(row.callOsi, callOsi.c_str(), sizeof(row.callOsi) - 1);
+        strncpy(row.putOsi,  putOsi.c_str(),  sizeof(row.putOsi)  - 1);
 
-            _iqChainMap[callOsi] = { &row, true  };
-            _iqChainMap[putOsi]  = { &row, false };
-            _activeIqSymbols.insert(callOsi);
-            _activeIqSymbols.insert(putOsi);
-        }
+        snap->map[callOsi] = { &row, true  };
+        snap->map[putOsi]  = { &row, false };
     }
 
-    for (const auto& sym : _activeIqSymbols)
-        _thetaClient.watch(sym.c_str());
+    std::atomic_store_explicit(&_chainSnap, snap, std::memory_order_release);
+
+    {
+        std::lock_guard<std::mutex> lk(_iqSymMutex);
+        for (const auto& kv : snap->map)
+            _activeIqSymbols.insert(kv.first);
+        for (const auto& sym : _activeIqSymbols)
+            _thetaClient.watch(sym.c_str());
+    }
 
     ++chainVersion;
     logf("Chain loaded: %s  %d strikes", expiration.c_str(), (int)strikes.size());
@@ -312,6 +394,7 @@ void TradingEngine::armContract(const char* symbol, const char* expiry,
 
     // Make sure ThetaData is watching both option legs
     if (_thetaClient.isConnected()) {
+        std::lock_guard<std::mutex> lk(_iqSymMutex);
         if (!_activeIqSymbols.count(optOsi)) {
             _thetaClient.watch(_armedOptSymbol);
             _activeIqSymbols.insert(optOsi);
@@ -328,6 +411,7 @@ void TradingEngine::armContract(const char* symbol, const char* expiry,
     // become visible to any thread that subsequently reads _contractsSet with acquire.
     _contractsSet.store(true, std::memory_order_release);
     logf("ARMED: %s %s %.2f %s | key: %s", symbol, expiry, strike, isCall ? "CALL" : "PUT", _armedOptSymbol);
+    _audit.write("ARM %s %s %.2f %s", symbol, expiry, strike, isCall ? "CALL" : "PUT");
 }
 
 // ============================================================
@@ -335,62 +419,94 @@ void TradingEngine::armContract(const char* symbol, const char* expiry,
 // ============================================================
 
 bool TradingEngine::startStrategy() {
-    SpinLockGuard guard(_processLock);
+    // Risk gate — checked before anything else so a fat-fingered qty can never start.
+    const double oq    = params.optQty.load(std::memory_order_relaxed);
+    const double maxOq = params.maxOptQty.load(std::memory_order_relaxed);
+    if (oq <= 0 || oq > maxOq) {
+        logf("START REFUSED: optQty %.2f outside (0, %.2f] — raise maxOptQty if intended", oq, maxOq);
+        return false;
+    }
 
-    if (!_contractsSet.load(std::memory_order_relaxed)) { log("No contract armed"); return false; }
-    if (!ibConnected())            { log("IB trade socket offline");    return false; }
-    if (_isStrategyRunning.load()) { log("Strategy already running");   return false; }
-
-    _activeOptQty             = params.optQty;
-    _sensorExecShares         = 0;
-    _sensorOrderStatusFilled  = 0;
-    _sensorPortfolioDiff      = 0;
-    _totalHedgedForEntry      = 0;
-    _isHedgeComplete          = false;
-    _lastProcessedBid         = 0;
-    _lastEntryPriceSent       = 0;
-    _lastEntryModTime         = {};
-
-    // Stamp qty into the pre-built templates now that it is known.
-    _entryOrderTemplate.totalQuantity = _activeOptQty;
-
+    const char* fail = nullptr;
+    DeferredLog dlog;
+    bool blindLaunch = false;
     {
-        SpinLockGuard hg(_hedgeLock);
-        _initialPosQty   = _lastKnownOptQty;
-        _lastOptionFillTime = {};
-        _processedExecIds.clear();   // cleared under _hedgeLock (matches execDetails dedup)
-    }
+        SpinLockGuard guard(_processLock);
 
-    _activeEntryOrderId.store(0);
-    _lastEntryOrderId.store(0);
-    _isStrategyRunning.store(true);
-    disp.strategyRunning.store(true);
+        if      (!_contractsSet.load(std::memory_order_relaxed)) fail = "No contract armed";
+        else if (!ibConnected())                                 fail = "IB trade socket offline";
+        else if (_isStrategyRunning.load())                      fail = "Strategy already running";
 
-    log("STRATEGY STARTED");
+        if (!fail) {
+            _activeOptQty.store(oq, std::memory_order_relaxed);
+            _lastProcessedBid.store(0.0, std::memory_order_relaxed);
+            _lastEntryPriceSent = 0;
+            _lastEntryModTime   = {};
+            _entryOrdersThisRun.store(0);
+            _consecRejects.store(0);
 
-    // For mode 1 (static price), fire immediately
-    if (params.entryMode == 1) {
-        double sAsk = _stockAsk.load(std::memory_order_relaxed);
-        double sBid = _stockBid.load(std::memory_order_relaxed);
-        double target = getLegalOptionPrice(params.staticPrice);
-        const auto now = Clock::now();
-        if (sBid > 0 && sAsk > 0) {
-            double mid = (sBid + sAsk) * 0.5;
-            double intrinsic = _isCall ? std::max(0.0, mid - _optionContract.strike)
-                                       : std::max(0.0, _optionContract.strike - mid);
-            double edge = intrinsic - target;
-            if (edge >= params.dynDiscount) {
-                placeEntryOrder(target, now);
-            } else {
-                stopStrategyLocked("Static price unsafe at start");
+            // Stamp qty into the pre-built template now that it is known.
+            // Order::totalQuantity is a BID64 Decimal — a raw double assignment
+            // would reinterpret the integer as a garbage BID64 encoding.
+            _entryOrderTemplate.totalQuantity = DecimalFunctions::doubleToDecimal(oq);
+
+            {
+                SpinLockGuard hg(_hedgeLock);
+                _sensorExecShares        = 0;
+                _sensorOrderStatusFilled = 0;
+                _sensorPortfolioDiff     = 0;
+                _hedgePlacedOptQty       = 0;
+                _hedgeFilledShares       = 0;
+                _hedgeRetries            = 0;
+                _hedgeAlarmed            = false;
+                _entryFillComplete       = false;
+                _isHedgeComplete         = false;
+                _hedgeOrders.clear();
+                _initialPosQty      = _lastKnownOptQty;
+                _lastOptionFillTime = {};
+                _processedExecIds.clear();   // cleared under _hedgeLock (matches execDetails dedup)
             }
-        } else {
-            // No spot price yet — fire blind at static price (matches C# behaviour)
-            logf("M1 blind launch @ %.2f (no spot data yet)", target);
-            placeEntryOrder(target, now);
-        }
-    }
 
+            _activeEntryOrderId.store(0);
+            _lastEntryOrderId.store(0);
+            _isStrategyRunning.store(true);
+            disp.strategyRunning.store(true);
+
+            // For mode 1 (static price), fire immediately
+            if (params.entryMode.load(std::memory_order_relaxed) == 1) {
+                double sAsk = _stockAsk.load(std::memory_order_relaxed);
+                double sBid = _stockBid.load(std::memory_order_relaxed);
+                double target = getLegalOptionPrice(params.staticPrice.load(std::memory_order_relaxed));
+                const auto now = Clock::now();
+                if (sBid > 0 && sAsk > 0) {
+                    double mid = (sBid + sAsk) * 0.5;
+                    double intrinsic = _isCall ? std::max(0.0, mid - _armedStrike)
+                                               : std::max(0.0, _armedStrike - mid);
+                    double edge = intrinsic - target;
+                    if (edge >= params.dynDiscount.load(std::memory_order_relaxed)) {
+                        dlog = placeEntryOrder(target, now);
+                    } else {
+                        stopStrategyLocked("Static price unsafe at start");
+                    }
+                } else {
+                    // No spot price yet — fire blind at static price (matches C# behaviour)
+                    blindLaunch = true;
+                    dlog = placeEntryOrder(target, now);
+                }
+            }
+        }
+    } // _processLock released — safe to log / audit now
+
+    if (fail) { log(fail); return false; }
+
+    if (_isStrategyRunning.load()) {
+        log("STRATEGY STARTED");
+        _audit.write("STRATEGY START mode=%d optQty=%.2f static=%.2f disc=%.2f",
+                     params.entryMode.load(), oq,
+                     params.staticPrice.load(), params.dynDiscount.load());
+    }
+    if (blindLaunch)  log("M1 blind launch (no spot data yet)");
+    if (dlog.pending) emitDeferred(dlog);
     return true;
 }
 
@@ -402,16 +518,23 @@ void TradingEngine::stopStrategyLocked(const char* reason) noexcept {
 
     {
         SpinLockGuard hg(_hedgeLock);
-        if (_totalHedgedForEntry > 0)
-            _lastKnownOptQty = std::max(_lastKnownOptQty, _initialPosQty + _totalHedgedForEntry);
+        if (_hedgePlacedOptQty > 0)
+            _lastKnownOptQty = std::max(_lastKnownOptQty, _initialPosQty + _hedgePlacedOptQty);
         _initialPosQty = _lastKnownOptQty;
     }
 
     int id = _activeEntryOrderId.exchange(0);
-    if (id && _tradeClient && _tradeClient->isConnected())
+    if (id && _tradeClient && _tradeClient->isConnected()) {
+        SpinLockGuard sg(_ibSendLock);
         _tradeClient->cancelOrder(id, OrderCancel{});
+    }
 
     logf("AUTO-STOP: %s", reason);
+
+    // Park the audit entry — fprintf must not run under _processLock.
+    // The watchdog thread flushes it within ~100 ms.
+    snprintf(_stopReason, sizeof(_stopReason), "%s", reason);
+    _stopAuditPending.store(true, std::memory_order_release);
 }
 
 void TradingEngine::stopStrategy(const char* reason) {
@@ -421,15 +544,63 @@ void TradingEngine::stopStrategy(const char* reason) {
 
 void TradingEngine::panicCancelAll() {
     stopStrategy("PANIC");
-    if (_tradeClient && _tradeClient->isConnected())
+    if (_tradeClient && _tradeClient->isConnected()) {
+        SpinLockGuard sg(_ibSendLock);
         _tradeClient->reqGlobalCancel(OrderCancel{});
+    }
     log("EMERGENCY STOP TRIGGERED");
+    _audit.write("PANIC — global cancel sent");
 }
 
 void TradingEngine::closeAllPositionsMKT() {
     stopStrategy("Close All Positions (MKT)");
-    log("CLOSE ALL MKT — implement position iteration here");
-    // Iterate your local position map and placeOrder(..., "MKT") for each
+    if (!_tradeClient || !_tradeClient->isConnected()) {
+        log("CLOSE ALL: IB offline");
+        return;
+    }
+    {
+        SpinLockGuard sg(_ibSendLock);
+        _tradeClient->reqGlobalCancel(OrderCancel{});
+    }
+
+    // Copy the position map so no lock is held while placing orders.
+    std::vector<PosRec> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(_posMutex);
+        snapshot.reserve(_positions.size());
+        for (const auto& kv : _positions)
+            if (std::abs(kv.second.qty) > 1e-9) snapshot.push_back(kv.second);
+    }
+
+    if (snapshot.empty()) {
+        log("CLOSE ALL: no open positions known");
+        return;
+    }
+
+    for (const auto& p : snapshot) {
+        Contract c = p.con;
+        if (c.exchange.empty()) c.exchange = "SMART";  // position() reports no exchange
+        if (c.currency.empty()) c.currency = "USD";
+
+        Order o{};
+        o.action        = p.qty > 0 ? "SELL" : "BUY";
+        o.orderType     = "MKT";
+        o.tif           = "DAY";
+        o.totalQuantity = DecimalFunctions::doubleToDecimal(std::abs(p.qty));
+        o.transmit      = true;
+
+        int id = getNextOrderId();
+        {
+            SpinLockGuard sg(_ibSendLock);
+            _tradeClient->placeOrder(id, c, o);
+        }
+        logf("CLOSE %s %.0f %s %s @ MKT (id=%d)", o.action.c_str(),
+             std::abs(p.qty), c.symbol.c_str(), c.secType.c_str(), id);
+        _audit.write("CLOSE-ALL %s %.2f %s %s strike=%.2f right=%s id=%d",
+                     o.action.c_str(), std::abs(p.qty), c.symbol.c_str(),
+                     c.secType.c_str(), c.strike, c.right.c_str(), id);
+    }
+    logf("CLOSE ALL: %d MKT orders sent", (int)snapshot.size());
 }
 
 // ============================================================
@@ -481,13 +652,20 @@ void TradingEngine::processIQData(const char* symbol, double bid, double ask,
 
     // 4. Fire price engine if we got new data for a trading-relevant symbol
     if (triggerProcess) {
+        // Heartbeat for the staleness watchdog — one relaxed increment (~5 ns),
+        // no clock call on the hot path.
+        _tickSeq.fetch_add(1, std::memory_order_relaxed);
         processPrice(_stockBid.load(std::memory_order_relaxed),
                      _stockAsk.load(std::memory_order_relaxed));
     }
 
-    // 5. Update chain grid row (UI only — transparent lookup avoids std::string ctor)
-    auto it = _iqChainMap.find(symbol);
-    if (it != _iqChainMap.end()) {
+    // 5. Update chain grid row (UI only). The snapshot shared_ptr is loaded
+    // atomically and held for the duration of the access, so a concurrent
+    // loadChain() can never free the rows under us (RCU — see ChainSnapshot).
+    auto snap = std::atomic_load_explicit(&_chainSnap, std::memory_order_acquire);
+    if (!snap) return;
+    auto it = snap->map.find(symbol);
+    if (it != snap->map.end()) {
         ChainRowData* rd = it->second.rowData;
         if (it->second.isCall) {
             if (bid  >= 0) rd->callBid.store(bid,  std::memory_order_relaxed);
@@ -515,10 +693,12 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
     // _armedStrike, _isCall, _armedOptSymbol and all templates are visible once this is true.
     if (!_contractsSet.load(std::memory_order_acquire)) return;
 
+    const int entryMode = params.entryMode.load(std::memory_order_relaxed);
+
     // Pre-filter 2 (Mode 2): skip spinlock when spot hasn't moved enough.
-    // Safe: _lastProcessedBid is single-writer (this thread only) — no race.
-    if (params.entryMode == 2 &&
-        std::abs(stockBid - _lastProcessedBid) < params.spotSens) return;
+    if (entryMode == 2 &&
+        std::abs(stockBid - _lastProcessedBid.load(std::memory_order_relaxed))
+            < params.spotSens.load(std::memory_order_relaxed)) return;
 
     // Read clock before acquiring the lock — removes a syscall from the critical section.
     const auto now = Clock::now();
@@ -527,24 +707,26 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
         SpinLockGuard guard(_processLock);
 
         if (stockAsk <= 0 || stockBid <= 0 || std::isnan(stockAsk) ||
-            std::isnan(stockBid) || stockAsk > params.maxSafePrice) return;
+            std::isnan(stockBid) ||
+            stockAsk > params.maxSafePrice.load(std::memory_order_relaxed)) return;
 
         // Advance the Mode-2 pre-filter baseline only after the tick is known
         // valid — a transient bad/over-cap ask must not move _lastProcessedBid,
         // or the spotSens filter would suppress later valid ticks at this bid.
-        if (params.entryMode == 2) _lastProcessedBid = stockBid;
+        if (entryMode == 2) _lastProcessedBid.store(stockBid, std::memory_order_relaxed);
 
         const bool isCall = _isCall;
         const double mid  = (stockBid + stockAsk) * 0.5;
         const double intrinsic = isCall ? std::max(0.0, mid - _armedStrike)
                                         : std::max(0.0, _armedStrike - mid);
 
+        const double dynDiscount = params.dynDiscount.load(std::memory_order_relaxed);
         double targetBid, currentEdge;
-        if (params.entryMode == 1) {
-            targetBid    = getLegalOptionPrice(params.staticPrice);
+        if (entryMode == 1) {
+            targetBid    = getLegalOptionPrice(params.staticPrice.load(std::memory_order_relaxed));
             currentEdge  = intrinsic - targetBid;
         } else {
-            double raw   = intrinsic - params.dynDiscount;
+            double raw   = intrinsic - dynDiscount;
             if (raw < 0.05) raw = 0.05;
             targetBid    = getLegalOptionPrice(raw);
             currentEdge  = intrinsic - targetBid;
@@ -555,14 +737,15 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
 
         if (!_isStrategyRunning.load(std::memory_order_relaxed)) return;
 
-        if (params.entryMode == 1) {
-            if (currentEdge >= params.dynDiscount) {
+        const int updateDelayMs = params.updateDelayMs.load(std::memory_order_relaxed);
+        if (entryMode == 1) {
+            if (currentEdge >= dynDiscount) {
                 int activeId = _activeEntryOrderId.load(std::memory_order_relaxed);
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastEntryModTime).count();
                 if (activeId == 0) {
-                    if (ms > params.updateDelayMs) dlog = placeEntryOrder(targetBid, now);
+                    if (ms > updateDelayMs) dlog = placeEntryOrder(targetBid, now);
                 } else if (std::abs(_lastEntryPriceSent - targetBid) > 0.001) {
-                    if (ms > params.updateDelayMs) dlog = updateEntryOrder(targetBid, now);
+                    if (ms > updateDelayMs) dlog = updateEntryOrder(targetBid, now);
                 }
             } else {
                 if (_activeEntryOrderId.load(std::memory_order_relaxed) != 0)
@@ -571,7 +754,7 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
         } else {
             // Mode 2: _lastProcessedBid was committed above, after the validity gate
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastEntryModTime).count();
-            if (ms > params.updateDelayMs) {
+            if (ms > updateDelayMs) {
                 int activeId = _activeEntryOrderId.load(std::memory_order_relaxed);
                 if (activeId == 0)
                     dlog = placeEntryOrder(targetBid, now);
@@ -580,7 +763,7 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
             }
         }
     } // _processLock released — safe to call onLog now
-    if (dlog.pending) log(dlog.msg);
+    if (dlog.pending) emitDeferred(dlog);
 }
 
 // ============================================================
@@ -590,7 +773,15 @@ void TradingEngine::processPrice(double stockBid, double stockAsk) noexcept {
 
 TradingEngine::DeferredLog TradingEngine::placeEntryOrder(double price, TimePoint now) noexcept {
     DeferredLog dlog;
-    if (_activeOptQty <= 0) return dlog;
+    if (_activeOptQty.load(std::memory_order_relaxed) <= 0) return dlog;
+
+    // Runaway guard: a bug in the update loop must not hammer IBKR forever.
+    if (_entryOrdersThisRun.fetch_add(1, std::memory_order_relaxed)
+            >= params.maxOrdersPerRun.load(std::memory_order_relaxed)) {
+        stopStrategyLocked("Entry order cap reached (maxOrdersPerRun)");
+        return dlog;
+    }
+
     const double lp = price; // already getLegalOptionPrice() — computed once in processPrice/startStrategy
 
     // totalQuantity set once in startStrategy() — only price changes per order.
@@ -599,7 +790,10 @@ TradingEngine::DeferredLog TradingEngine::placeEntryOrder(double price, TimePoin
     int newId = getNextOrderId();
     _activeEntryOrderId.store(newId);
     _lastEntryOrderId.store(newId);
-    _tradeClient->placeOrder(newId, _optionContract, _entryOrderTemplate);
+    {
+        SpinLockGuard sg(_ibSendLock);
+        _tradeClient->placeOrder(newId, _optionContract, _entryOrderTemplate);
+    }
     _lastEntryPriceSent = lp;
     _lastEntryModTime   = now;
 
@@ -612,10 +806,20 @@ TradingEngine::DeferredLog TradingEngine::updateEntryOrder(double price, TimePoi
     DeferredLog dlog;
     int activeId = _activeEntryOrderId.load(std::memory_order_relaxed);
     if (activeId <= 0) return dlog;
+
+    if (_entryOrdersThisRun.fetch_add(1, std::memory_order_relaxed)
+            >= params.maxOrdersPerRun.load(std::memory_order_relaxed)) {
+        stopStrategyLocked("Entry order cap reached (maxOrdersPerRun)");
+        return dlog;
+    }
+
     const double lp = price; // already getLegalOptionPrice() — computed once in processPrice
 
     _entryOrderTemplate.lmtPrice = lp;
-    _tradeClient->placeOrder(activeId, _optionContract, _entryOrderTemplate);
+    {
+        SpinLockGuard sg(_ibSendLock);
+        _tradeClient->placeOrder(activeId, _optionContract, _entryOrderTemplate);
+    }
     _lastEntryPriceSent = lp;
     _lastEntryModTime   = now;
 
@@ -634,28 +838,35 @@ void TradingEngine::evaluateHedge() noexcept {
     {
         SpinLockGuard guard(_hedgeLock);
 
-        if (_isHedgeComplete) return;
+        // Retry budget exhausted — a human must intervene; stop auto-placing.
+        if (_hedgeAlarmed) return;
 
         double maxKnown = std::max({_sensorExecShares,
                                     _sensorOrderStatusFilled,
                                     _sensorPortfolioDiff});
-        if (maxKnown > _activeOptQty) maxKnown = _activeOptQty;
+        const double activeQty = _activeOptQty.load(std::memory_order_relaxed);
+        if (maxKnown > activeQty) maxKnown = activeQty;
 
-        double unhedged = maxKnown - _totalHedgedForEntry;
-        if (unhedged <= 0) return;
+        // PLACED is not FILLED: _hedgePlacedOptQty only tracks coverage we have
+        // *ordered*. Fill confirmation and shortfall retry live in orderStatus().
+        double unplaced = maxKnown - _hedgePlacedOptQty;
+        if (unplaced > 0) {
+            _hedgePlacedOptQty += unplaced;
+            dlog = executeHedgeActual(unplaced);
+        }
 
-        _totalHedgedForEntry += unhedged;
-        dlog = executeHedgeActual(unhedged);
-
-        if (_totalHedgedForEntry >= _activeOptQty) {
-            _isHedgeComplete = true;
+        if (!_entryFillComplete && maxKnown >= activeQty && activeQty > 0) {
+            _entryFillComplete = true;
             _isStrategyRunning.store(false);
             disp.strategyRunning.store(false);
             targetFilled = true;
         }
     } // _hedgeLock released — safe to call onLog now
-    if (targetFilled)  log("TARGET FILLED — auto-stop");
-    if (dlog.pending)  log(dlog.msg);
+    if (dlog.pending)  emitDeferred(dlog);
+    if (targetFilled) {
+        log("TARGET FILLED — auto-stop");
+        _audit.write("TARGET FILLED — entry complete, strategy stopped");
+    }
 }
 
 TradingEngine::DeferredLog TradingEngine::executeHedgeActual(double optShares) noexcept {
@@ -664,24 +875,33 @@ TradingEngine::DeferredLog TradingEngine::executeHedgeActual(double optShares) n
 
     double sBid = _stockBid.load(std::memory_order_relaxed);
     double sAsk = _stockAsk.load(std::memory_order_relaxed);
+    const double hedgeOffset = params.hedgeOffset.load(std::memory_order_relaxed);
 
     double limitPrice;
     Order& htmpl = _isCall ? _hedgeCallTemplate : _hedgePutTemplate;
     if (_isCall)
-        limitPrice = (sAsk > 0) ? sAsk - params.hedgeOffset : sBid;
+        limitPrice = (sAsk > 0) ? sAsk - hedgeOffset : sBid;
     else
-        limitPrice = (sAsk > 0) ? sAsk + params.hedgeOffset : sBid;
+        limitPrice = (sAsk > 0) ? sAsk + hedgeOffset : sBid;
     double safePx = std::round(limitPrice * 100.0) / 100.0;
 
-    double qty = optShares * params.hedgeQty;
+    double qty = optShares * params.hedgeQty.load(std::memory_order_relaxed);
 
-    htmpl.totalQuantity = qty;
+    htmpl.totalQuantity = DecimalFunctions::doubleToDecimal(qty);
     htmpl.lmtPrice      = safePx;
 
     int hid = getNextOrderId();
-    _activeHedgeOrderId.store(hid);
-    _lastHedgeOrderId.store(hid);
-    _tradeClient->placeOrder(hid, _hedgeContract, htmpl);
+    // Record before sending so an instant orderStatus callback finds the entry.
+    HedgeOrderRec rec;
+    rec.qtyShares = qty;
+    rec.lmtPrice  = safePx;
+    rec.open      = true;
+    rec.placedAt  = Clock::now();
+    _hedgeOrders[hid] = rec;
+    {
+        SpinLockGuard sg(_ibSendLock);
+        _tradeClient->placeOrder(hid, _hedgeContract, htmpl);
+    }
 
     snprintf(dlog.msg, sizeof(dlog.msg), "HEDGE: %s %.0f STK @ %.2f (id=%d)",
              htmpl.action.c_str(), qty, safePx, hid);
@@ -701,13 +921,14 @@ void TradingEngine::nextValidId(int orderId) {
 }
 
 void TradingEngine::currentTime(long long /*time*/) {
-    auto now = Clock::now();
-    if (_ibPingReqTime != TimePoint{}) {
-        int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - _ibPingReqTime).count();
-        disp.ibPingMs.store(ms);
+    // Response to the watchdog's 1 Hz reqCurrentTime ping. The previous version
+    // re-armed the request from here, which would have self-sustained at RTT
+    // period and flooded TWS — the watchdog owns the cadence now.
+    long long reqNs = _ibPingReqNs.load(std::memory_order_relaxed);
+    if (reqNs > 0) {
+        long long nowNs = Clock::now().time_since_epoch().count();
+        disp.ibPingMs.store((int)((nowNs - reqNs) / 1000000));
     }
-    _ibPingReqTime = now;
-    _tradeClient->reqCurrentTime();
 }
 
 void TradingEngine::error(int id, time_t /*errorTime*/, int errorCode,
@@ -734,20 +955,65 @@ void TradingEngine::error(int id, time_t /*errorTime*/, int errorCode,
     }
 
     logf("ERR %d: %s", errorCode, errorStr.c_str());
+    _audit.write("IB ERR %d (id=%d): %s", errorCode, id, errorStr.c_str());
 
     if (id > 0) {
         bool isFatal = (errorCode == 201 || errorCode == 202 ||
                         errorCode == 104 || errorCode == 203 || errorCode == 399);
         if (isFatal) {
-            // Hold _processLock so the compare-and-clear cannot race the order
-            // placement path (which stores _activeEntryOrderId under the same
-            // lock). Use stopStrategyLocked since we already hold the lock; it
-            // also exchanges _activeEntryOrderId to 0 and cancels the order.
-            SpinLockGuard guard(_processLock);
-            if (id == _activeEntryOrderId.load(std::memory_order_relaxed)) {
-                stopStrategyLocked("IBKR rejected order");
-            } else if (id == _activeHedgeOrderId.load(std::memory_order_relaxed)) {
-                _activeHedgeOrderId.store(0);
+            bool hedgeRejected = false;
+            bool hedgeAlarm    = false;
+            {
+                // Hold _processLock so the compare-and-clear cannot race the order
+                // placement path (which stores _activeEntryOrderId under the same
+                // lock). Use stopStrategyLocked since we already hold the lock; it
+                // also exchanges _activeEntryOrderId to 0 and cancels the order.
+                SpinLockGuard guard(_processLock);
+                if (id == _activeEntryOrderId.load(std::memory_order_relaxed)) {
+                    stopStrategyLocked("IBKR rejected order");
+                }
+            }
+            {
+                // Hedge rejection: give the unfilled coverage back so
+                // evaluateHedge re-places it, within the retry budget.
+                SpinLockGuard hg(_hedgeLock);
+                auto it = _hedgeOrders.find(id);
+                if (it != _hedgeOrders.end() && it->second.open) {
+                    it->second.open = false;
+                    double shortfall = it->second.qtyShares - it->second.filledShares;
+                    double hq = params.hedgeQty.load(std::memory_order_relaxed);
+                    if (shortfall > 1e-9 && hq > 0) {
+                        _hedgePlacedOptQty -= shortfall / hq;
+                        if (++_hedgeRetries > params.maxHedgeRetries.load(std::memory_order_relaxed)) {
+                            _hedgeAlarmed = true;
+                            hedgeAlarm    = true;
+                        } else {
+                            hedgeRejected = true;
+                        }
+                    }
+                }
+            }
+            if (hedgeRejected) {
+                logf("HEDGE order %d rejected — re-placing", id);
+                _audit.write("HEDGE REJECTED id=%d — re-placing", id);
+                evaluateHedge();
+            }
+            if (hedgeAlarm) {
+                log("!!! HEDGE FAILED REPEATEDLY — POSITION MAY BE NAKED — MANUAL ACTION REQUIRED !!!");
+                _audit.write("HEDGE ALARM: retry budget exhausted, id=%d — manual action required", id);
+            }
+
+            // Kill switch: repeated fatal rejections mean something is wrong
+            // (margin, permissions, contract) — stop hammering the broker.
+            int rejects = _consecRejects.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (rejects == params.maxConsecRejects.load(std::memory_order_relaxed)) {
+                stopStrategy("Kill switch: consecutive rejects");
+                if (_tradeClient && _tradeClient->isConnected()) {
+                    SpinLockGuard sg(_ibSendLock);
+                    _tradeClient->reqGlobalCancel(OrderCancel{});
+                }
+                log("!!! KILL SWITCH: consecutive order rejects — global cancel sent !!!");
+                _audit.write("KILL SWITCH after %d consecutive rejects — global cancel", rejects);
             }
         }
     }
@@ -772,9 +1038,11 @@ void TradingEngine::execDetails(int /*reqId*/, const Contract& contract,
             exec.side == "BOT")
             isOurEntry = true;
     }
-    bool isOurHedge = (!isOurEntry &&
-                       exec.orderId == (long long)_lastHedgeOrderId.load() &&
-                       _lastHedgeOrderId.load() != 0);
+    bool isOurHedge = false;
+    if (!isOurEntry) {
+        SpinLockGuard hg(_hedgeLock);
+        isOurHedge = _hedgeOrders.count((int)exec.orderId) != 0;
+    }
 
     if (isOurEntry) {
         SpinLockGuard hg(_hedgeLock);
@@ -783,17 +1051,30 @@ void TradingEngine::execDetails(int /*reqId*/, const Contract& contract,
         if (_lastOptionFillTime == TimePoint{}) _lastOptionFillTime = Clock::now();
         // Release hedge lock before evaluateHedge (it re-acquires)
     }
-    if (isOurEntry) evaluateHedge();
+    if (isOurEntry) {
+        _consecRejects.store(0, std::memory_order_relaxed);  // a real fill ends a reject streak
+        _audit.write("FILL ENTRY %s %.2f @ %.4f id=%lld execId=%s",
+                     exec.side.c_str(), DecimalFunctions::decimalToDouble(exec.shares),
+                     exec.price, (long long)exec.orderId, exec.execId.c_str());
+        evaluateHedge();
+    }
 
     if (isOurHedge) {
-        SpinLockGuard hg(_hedgeLock);
-        _processedExecIds.insert(exec.execId);
-        if (_lastOptionFillTime != TimePoint{}) {
-            double ms = std::chrono::duration_cast<std::chrono::microseconds>(
-                Clock::now() - _lastOptionFillTime).count() / 1000.0;
-            logf("[LATENCY OPT->STK HEDGE] %.2f ms", ms);
-            _lastOptionFillTime = {};
+        double latencyMs = -1.0;
+        {
+            SpinLockGuard hg(_hedgeLock);
+            _processedExecIds.insert(exec.execId);
+            if (_lastOptionFillTime != TimePoint{}) {
+                latencyMs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now() - _lastOptionFillTime).count() / 1000.0;
+                _lastOptionFillTime = {};
+            }
         }
+        if (latencyMs >= 0) logf("[LATENCY OPT->STK HEDGE] %.2f ms", latencyMs);
+        _consecRejects.store(0, std::memory_order_relaxed);
+        _audit.write("FILL HEDGE %s %.2f @ %.4f id=%lld execId=%s",
+                     exec.side.c_str(), DecimalFunctions::decimalToDouble(exec.shares),
+                     exec.price, (long long)exec.orderId, exec.execId.c_str());
     }
 }
 
@@ -821,16 +1102,79 @@ void TradingEngine::orderStatus(int orderId, const std::string& status,
         if (doHedge) evaluateHedge();
 
         if (isTerminal) {
+            _audit.write("ENTRY TERMINAL id=%d status=%s filled=%.2f", orderId, status.c_str(), filledD);
             if (status == "Filled")
                 stopStrategy("Entry completely filled");
             else
                 stopStrategy(("Entry terminal: " + status).c_str());
         }
+        return;
     }
 
-    if (orderId == _activeHedgeOrderId.load() && isTerminal) {
-        _activeHedgeOrderId.store(0);
+    // ----------------------------------------------------------------
+    // Hedge orders: confirm fills (placed != filled), retry shortfalls.
+    // ----------------------------------------------------------------
+    bool   knownHedge  = false;
+    bool   retryHedge  = false;
+    bool   alarmHedge  = false;
+    bool   hedgeDone   = false;
+    double shortfall   = 0.0;
+    double filledTotal = 0.0;
+    {
+        SpinLockGuard hg(_hedgeLock);
+        auto it = _hedgeOrders.find(orderId);
+        if (it == _hedgeOrders.end()) return;
+        knownHedge = true;
+        HedgeOrderRec& rec = it->second;
+
+        double filledD = DecimalFunctions::decimalToDouble(filled);
+        if (filledD > rec.filledShares) {
+            _hedgeFilledShares += filledD - rec.filledShares;
+            rec.filledShares = filledD;
+        }
+
+        if (isTerminal && rec.open) {
+            rec.open  = false;
+            shortfall = rec.qtyShares - rec.filledShares;
+            if (shortfall > 1e-9 && status != "Filled") {
+                // Give the unfilled coverage back so evaluateHedge re-places it.
+                double hq = params.hedgeQty.load(std::memory_order_relaxed);
+                if (hq > 0) _hedgePlacedOptQty -= shortfall / hq;
+                if (++_hedgeRetries > params.maxHedgeRetries.load(std::memory_order_relaxed)) {
+                    _hedgeAlarmed = true;
+                    alarmHedge    = true;
+                } else {
+                    retryHedge = true;
+                }
+            }
+        }
+
+        // Hedge truly complete only when every placed share is confirmed filled.
+        double targetShares = _hedgePlacedOptQty * params.hedgeQty.load(std::memory_order_relaxed);
+        if (!_isHedgeComplete && _entryFillComplete &&
+            targetShares > 0 && _hedgeFilledShares + 1e-9 >= targetShares) {
+            _isHedgeComplete = true;
+            hedgeDone        = true;
+        }
+        filledTotal = _hedgeFilledShares;
+    }
+
+    if (knownHedge && isTerminal) {
         logf("Hedge %d: %s", orderId, status.c_str());
+        _audit.write("HEDGE TERMINAL id=%d status=%s", orderId, status.c_str());
+    }
+    if (retryHedge) {
+        logf("HEDGE SHORTFALL %.0f shares (order %d %s) — re-placing", shortfall, orderId, status.c_str());
+        _audit.write("HEDGE SHORTFALL %.2f shares id=%d status=%s — re-placing", shortfall, orderId, status.c_str());
+        evaluateHedge();
+    }
+    if (alarmHedge) {
+        log("!!! HEDGE FAILED REPEATEDLY — POSITION MAY BE NAKED — MANUAL ACTION REQUIRED !!!");
+        _audit.write("HEDGE ALARM: retry budget exhausted, %.2f shares uncovered (id=%d)", shortfall, orderId);
+    }
+    if (hedgeDone) {
+        log("HEDGE COMPLETE — all shares confirmed filled");
+        _audit.write("HEDGE COMPLETE — %.2f shares filled", filledTotal);
     }
 }
 
@@ -888,12 +1232,26 @@ void TradingEngine::managedAccounts(const std::string& accountsList) {
 void TradingEngine::position(const std::string& /*account*/,
                               const Contract& contract,
                               Decimal pos, double avgCost) {
+    double qty = DecimalFunctions::decimalToDouble(pos);
+
+    // Maintain the full position map — closeAllPositionsMKT iterates it.
+    {
+        char key[128];
+        snprintf(key, sizeof(key), "%s|%s|%s|%.3f|%s",
+                 contract.symbol.c_str(), contract.secType.c_str(),
+                 contract.lastTradeDateOrContractMonth.c_str(),
+                 contract.strike, contract.right.c_str());
+        std::lock_guard<std::mutex> lk(_posMutex);
+        if (std::abs(qty) < 1e-9) _positions.erase(key);
+        else                      _positions[key] = { contract, qty };
+    }
+
     if (!_contractsSet.load(std::memory_order_relaxed)) return;
     if (contract.symbol == _optionContract.symbol &&
         std::abs(contract.strike - _optionContract.strike) < 0.001 &&
         contract.right == _optionContract.right) {
         SpinLockGuard hg(_hedgeLock);
-        _lastKnownOptQty = DecimalFunctions::decimalToDouble(pos);
+        _lastKnownOptQty = qty;
     }
     (void)avgCost;
 }
@@ -932,10 +1290,13 @@ void TradingEngine::updatePortfolio(const Contract& contract, Decimal position,
 // HELPERS
 // ============================================================
 
-double TradingEngine::getLegalOptionPrice(double price) noexcept {
-    if (price < 3.00)
+double TradingEngine::getLegalOptionPrice(double price) const noexcept {
+    // tickMode 1: penny increments at all prices — penny-interval-program
+    // classes (SPY, QQQ, ...) quote in pennies even above $3; rounding to
+    // nickels there gives away up to 4 cents of edge per order.
+    if (price < 3.00 || params.tickMode.load(std::memory_order_relaxed) == 1)
         return std::round(price * 100.0) / 100.0;
-    // Options above $3.00 tick in $0.05 increments
+    // Non-penny classes above $3.00 tick in $0.05 increments
     return std::round(price * 20.0) / 20.0;
 }
 
@@ -978,4 +1339,152 @@ void TradingEngine::logf(const char* fmt, ...) const {
     vsnprintf(buf, sizeof(buf), fmt, va);
     va_end(va);
     onLog(buf);
+}
+
+void TradingEngine::emitDeferred(const DeferredLog& d) {
+    if (!d.pending) return;
+    log(d.msg);
+    _audit.write("%s", d.msg);
+}
+
+// ============================================================
+// WATCHDOG — below-normal-priority thread, 100 ms tick.
+//   1. Data staleness: strategy running + no relevant tick for staleMs
+//      → cancel entry and stop (a resting order with frozen prices is
+//      pure adverse selection once the market moves).
+//   2. ThetaData auto-reconnect + re-subscribe after a feed drop.
+//   3. Hedge chase: reprice unfilled hedge orders, escalate to MKT.
+//   4. IB ping initiation (1 Hz; the response lands in currentTime()).
+// ============================================================
+
+void TradingEngine::watchdogLoop() noexcept {
+    uint64_t lastSeq       = 0;
+    auto     lastSeqChange = Clock::now();
+    auto     lastPing      = TimePoint{};
+    auto     lastReconnect = TimePoint{};
+
+    while (_watchRun.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto now = Clock::now();
+
+        // 0) Flush the stop-audit entry parked by stopStrategyLocked
+        //    (fprintf must not run while a spinlock is held).
+        if (_stopAuditPending.exchange(false, std::memory_order_acquire))
+            _audit.write("STRATEGY STOP: %s", _stopReason);
+
+        // 1) Data staleness
+        uint64_t seq = _tickSeq.load(std::memory_order_relaxed);
+        if (seq != lastSeq) {
+            lastSeq = seq;
+            lastSeqChange = now;
+        } else if (_isStrategyRunning.load(std::memory_order_relaxed)) {
+            int staleMs = params.staleMs.load(std::memory_order_relaxed);
+            if (staleMs > 0 &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSeqChange).count() >= staleMs) {
+                stopStrategy("Market data stale — entry cancelled");
+                lastSeqChange = now;  // don't re-trigger every 100 ms
+            }
+        }
+
+        // 1b) Outright feed loss while running — don't wait out staleMs.
+        if (_isStrategyRunning.load(std::memory_order_relaxed) &&
+            _iqShouldBeConnected.load() && !_thetaClient.isConnected()) {
+            stopStrategy("ThetaData feed lost — entry cancelled");
+        }
+
+        // 2) ThetaData auto-reconnect (1 Hz attempts)
+        if (_iqShouldBeConnected.load() && !_thetaClient.isConnected() &&
+            (lastReconnect == TimePoint{} || now - lastReconnect >= std::chrono::seconds(1))) {
+            lastReconnect = now;
+            if (_thetaClient.connect(_iqHost, _iqPort)) {
+                int n = 0;
+                {
+                    std::lock_guard<std::mutex> lk(_iqSymMutex);
+                    for (const auto& s : _activeIqSymbols) _thetaClient.watch(s.c_str());
+                    n = (int)_activeIqSymbols.size();
+                }
+                logf("ThetaData reconnected — %d subscriptions restored", n);
+                _audit.write("THETA RECONNECTED (%d symbols)", n);
+            }
+        }
+
+        // 3) Hedge chase
+        chaseHedges(now);
+
+        // 4) IB ping
+        if ((lastPing == TimePoint{} || now - lastPing >= std::chrono::seconds(1)) && ibConnected()) {
+            lastPing = now;
+            _ibPingReqNs.store(now.time_since_epoch().count(), std::memory_order_relaxed);
+            SpinLockGuard sg(_ibSendLock);
+            _tradeClient->reqCurrentTime();
+        }
+    }
+}
+
+void TradingEngine::chaseHedges(TimePoint now) noexcept {
+    const int chaseMs   = params.hedgeChaseMs.load(std::memory_order_relaxed);
+    const int maxChases = params.maxHedgeChases.load(std::memory_order_relaxed);
+    if (chaseMs <= 0) return;  // 0 disables chasing
+
+    double sBid = _stockBid.load(std::memory_order_relaxed);
+    double sAsk = _stockAsk.load(std::memory_order_relaxed);
+    const double off = params.hedgeOffset.load(std::memory_order_relaxed);
+
+    // Collect actions under the lock, send after — placeOrder never runs
+    // while _hedgeLock is held by this thread.
+    struct Chase { int id; double qty; double px; bool mkt; };
+    Chase actions[8];
+    int nActions = 0;
+    {
+        SpinLockGuard hg(_hedgeLock);
+        for (auto& kv : _hedgeOrders) {
+            HedgeOrderRec& rec = kv.second;
+            if (!rec.open) continue;
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - rec.placedAt).count() < chaseMs)
+                continue;
+            if (nActions >= 8) break;
+
+            Chase a{};
+            a.id  = kv.first;
+            a.qty = rec.qtyShares;
+            if (rec.chases >= maxChases) {
+                a.mkt = true;
+                a.px  = 0;
+            } else {
+                // Cross the spread progressively: SELL hedges step below the
+                // bid, BUY hedges step above the ask, one offset per chase.
+                a.mkt = false;
+                int step = rec.chases + 1;
+                if (_isCall) a.px = (sBid > 0 ? sBid : rec.lmtPrice) - off * step;
+                else         a.px = (sAsk > 0 ? sAsk : rec.lmtPrice) + off * step;
+                a.px = std::round(a.px * 100.0) / 100.0;
+                if (a.px < 0.01) a.px = 0.01;
+                rec.lmtPrice = a.px;
+            }
+            rec.chases++;
+            rec.placedAt = now;
+            actions[nActions++] = a;
+        }
+    }
+
+    for (int i = 0; i < nActions; ++i) {
+        const Chase& a = actions[i];
+        if (!_tradeClient || !_tradeClient->isConnected()) break;
+        // Modify in place: same order id, more aggressive price (or MKT).
+        Order o = _isCall ? _hedgeCallTemplate : _hedgePutTemplate;
+        o.totalQuantity = DecimalFunctions::doubleToDecimal(a.qty);
+        if (a.mkt) { o.orderType = "MKT"; o.lmtPrice = 0;    }
+        else       {                      o.lmtPrice = a.px; }
+        {
+            SpinLockGuard sg(_ibSendLock);
+            _tradeClient->placeOrder(a.id, _hedgeContract, o);
+        }
+        if (a.mkt) {
+            logf("HEDGE CHASE id=%d -> MKT (unfilled after %d limit chases)", a.id, maxChases);
+            _audit.write("HEDGE CHASE id=%d -> MKT", a.id);
+        } else {
+            logf("HEDGE CHASE id=%d -> %.2f", a.id, a.px);
+            _audit.write("HEDGE CHASE id=%d -> %.2f", a.id, a.px);
+        }
+    }
 }

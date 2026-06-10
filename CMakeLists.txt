@@ -61,6 +61,23 @@ else()
 endif()
 
 # -----------------------------------------------------------------------
+# Sanitizer builds (GCC/Clang only) — for test/dev builds, never production.
+# TSan catches the data races the lock-free hot path must avoid:
+#   cmake -B build-tsan -DENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=Debug
+# -----------------------------------------------------------------------
+option(ENABLE_ASAN "Build with AddressSanitizer" OFF)
+option(ENABLE_TSAN "Build with ThreadSanitizer"  OFF)
+if(NOT MSVC)
+    if(ENABLE_ASAN)
+        add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+        add_link_options(-fsanitize=address)
+    elseif(ENABLE_TSAN)
+        add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+        add_link_options(-fsanitize=thread)
+    endif()
+endif()
+
+# -----------------------------------------------------------------------
 # TARGET 1: robottrading_engine
 #   Pure trading engine — no UI, no console commands.
 #   Exposes ControlServer on localhost:7799.
@@ -127,6 +144,32 @@ else()
 endif()
 
 # -----------------------------------------------------------------------
+# TARGET 3: robottrading_tests
+#   Unit/integration tests for the ThetaData client (mock WS server on
+#   localhost). Needs neither IBApi nor protobuf.
+#   Run: build\Release\robottrading_tests.exe   (or: ctest --test-dir build)
+# -----------------------------------------------------------------------
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS)
+    enable_testing()
+    add_executable(robottrading_tests
+        tests/test_thetadata.cpp
+        engine/ThetaDataClient.cpp
+    )
+    target_include_directories(robottrading_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/engine
+    )
+    if(WIN32)
+        target_link_libraries(robottrading_tests ws2_32)
+    else()
+        target_link_libraries(robottrading_tests pthread)
+        target_compile_definitions(robottrading_tests PRIVATE _GNU_SOURCE)
+    endif()
+    add_test(NAME thetadata COMMAND robottrading_tests)
+endif()
+
+# -----------------------------------------------------------------------
 # Build type default
 # -----------------------------------------------------------------------
 if(NOT CMAKE_BUILD_TYPE)
@@ -135,4 +178,4 @@ endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "IBKR API dir: ${IBAPI_DIR}")
-message(STATUS "Targets: robottrading_engine  robottrading_ui")
+message(STATUS "Targets: robottrading_engine  robottrading_ui  robottrading_tests")

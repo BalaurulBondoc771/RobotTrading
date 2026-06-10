@@ -24,8 +24,15 @@ using IQDataCallback = std::function<void(const char* sym,
 //             e.g.           "SPY20241220C500000"  ($500 call, 2024-12-20)
 //             strike_millicents = (int)round(strikeUSD * 1000)
 //
-// Verify ThetaData JSON field names against:
-//   https://docs.thetadata.us/docs/streaming-websocket
+// Wire protocol (Theta Terminal v2, verified against
+// https://http-docs.thetadata.us/Streaming/Getting-Started.html):
+//   Endpoint:    ws://127.0.0.1:25520/v1/events  (single connection only)
+//   Subscribe:   {"msg_type":"STREAM","sec_type":"OPTION","req_type":"QUOTE",
+//                 "add":true,"id":N,"contract":{"root":"SPY","expiration":20241220,
+//                 "strike":500000,"right":"C"}}
+//   Unsubscribe: same message with "add":false
+//   Quote msg:   {"header":{"type":"QUOTE",...},"contract":{...},"quote":{"bid":..,"ask":..}}
+//   Strike unit: 1/10 cent (millicents) — matches our key convention.
 // -----------------------------------------------------------------------
 class ThetaDataClient {
 public:
@@ -40,16 +47,21 @@ public:
     bool watch  (const char* key) noexcept;
     bool unwatch(const char* key) noexcept;
 
+    // Fired for non-quote server messages (errors, stream responses) and from
+    // connection-level events. May be called from the recv thread — keep it cheap.
+    std::function<void(const char* msg)> onLog;
+
 private:
     socket_t          _sock = INVALID_SOCK;
     std::atomic<bool> _connected{false};
     IQDataCallback    _cb;
     std::thread       _recvThread;
+    std::atomic<int>  _streamReqId{0};    // "id" field of STREAM requests
+    char              _lastNonQuoteType[16] = {}; // dedup for non-quote log lines
 
     char _frameAccum[1 << 16]; // 64 KB: WebSocket frame accumulation
     int  _frameAccumLen = 0;
     char _msgBuf[1 << 16];     // 64 KB: decoded message text
-    char _cmdBuf[512];          // outgoing subscription JSON
 
     bool wsHandshake(const char* host, uint16_t port) noexcept;
     bool wsSendText (const char* json) noexcept;
@@ -70,5 +82,7 @@ private:
                                 char* right,
                                 int*  strikeMillicents) noexcept;
 
-    void buildSubscribeJson(const char* key, bool subscribe) noexcept;
+    // Builds into caller-provided buffer — watch/unwatch may be called from
+    // multiple control threads concurrently, so no shared member buffer.
+    void buildSubscribeJson(char* out, int outSz, const char* key, bool subscribe) noexcept;
 };
